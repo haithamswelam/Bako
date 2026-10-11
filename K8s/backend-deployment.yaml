@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: bako-backend
-          image: 483272865934.dkr.ecr.eu-north-1.amazonaws.com/bako-backend:034c3222eb7ea294bdf3b9b4d109e92d898fb67d
+          image: 483272865934.dkr.ecr.eu-north-1.amazonaws.com/bako-backend:dcd0ac59e94282900a952e04516bc483a2993f8b
           ports:
             - containerPort: 8000
           env:
