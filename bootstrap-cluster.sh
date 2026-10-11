@@ -53,3 +53,7 @@ echo
 echo
 echo "Done. Run: kubectl get applications -n argocd   (watch for Synced/Healthy)"
 echo "Then:      kubectl port-forward svc/argocd-server -n argocd 8081:443"
+echo
+echo
+echo " Check Cluster is up and running"
+kubectl get pods -n bako
