@@ -26,3 +26,8 @@ infra-Bako-eks/terraform.tfstate
 infra-Bako-eks/terraform.tfstate.backup
 infra-Bako-eks/*.tfstate
 infra-Bako-eks/*.tfstate.*
+
+# bako agent lab
+agent/.venv/
+agent/env/reports/
+*.tfplan
