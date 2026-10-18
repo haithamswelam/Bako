@@ -9,6 +9,7 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   backend-ci:
@@ -65,31 +66,11 @@ jobs:
       - name: Run frontend tests
         run: npm run test
 
-      - name: Check if image tag already exists
-        id: check
-        run: |
-         if aws ecr describe-images --repository-name bako-backend \
-         --image-ids imageTag=${{ github.sha }} >/dev/null 2>&1; then
-         echo "exists=true" >> "$GITHUB_OUTPUT"
-         else
-         echo "exists=false" >> "$GITHUB_OUTPUT"
-         fi
-
-      - name: Check if frontend image exists
-        id: check_frontend
-        run: |
-         if aws ecr describe-images --repository-name bako-frontend \
-         --image-ids imageTag=${{ github.sha }} >/dev/null 2>&1; then
-         echo "exists=true" >> "$GITHUB_OUTPUT"
-         else
-         echo "exists=false" >> "$GITHUB_OUTPUT"
-         fi
-
   build-and-push:
     name: Build and Push Images
     runs-on: ubuntu-latest
     needs: [backend-ci, frontend-ci]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: write
@@ -98,12 +79,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      #- #name: Debug OIDC token claims
-      #  ##run: |
-      #  ##   #IDTOKEN=$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-        #   #"$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-           #echo "$IDTOKEN" | cut -d '.' -f2 | base64 -d 2>/dev/null | jq .
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -114,11 +89,36 @@ jobs:
           aws-region: eu-north-1
           role-skip-session-tagging: true
 
+      - name: Check if backend image exists
+        id: check_backend
+        run: |
+          if OUT=$(aws ecr describe-images --repository-name bako-backend \
+               --image-ids imageTag=${{ github.sha }} 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif echo "$OUT" | grep -q ImageNotFoundException; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$OUT"; exit 1
+          fi
+
+      - name: Check if frontend image exists
+        id: check_frontend
+        run: |
+          if OUT=$(aws ecr describe-images --repository-name bako-frontend \
+               --image-ids imageTag=${{ github.sha }} 2>&1); then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif echo "$OUT" | grep -q ImageNotFoundException; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$OUT"; exit 1
+          fi
+
       - name: Log in to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push backend image
+        if: steps.check_backend.outputs.exists == 'false'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -127,6 +127,7 @@ jobs:
           docker push $ECR_REGISTRY/bako-backend:$IMAGE_TAG
 
       - name: Build and push frontend image
+        if: steps.check_frontend.outputs.exists == 'false'
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
@@ -140,7 +141,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          BRANCH="deploy/image-${IMAGE_TAG::7}"
+          BRANCH="deploy/image-${IMAGE_TAG::7}-${GITHUB_RUN_ID}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
