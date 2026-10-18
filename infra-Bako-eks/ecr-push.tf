@@ -18,6 +18,7 @@ resource "aws_iam_policy" "github_actions_ecr_push" {
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
           "ecr:PutImage",
+          "ecr:DescribeImages",
           "ecr:InitiateLayerUpload",
           "ecr:UploadLayerPart",
           "ecr:CompleteLayerUpload"
