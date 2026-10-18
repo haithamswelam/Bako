@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agent/env/checks.sh — plain checks, no LLM.
-# Usage: bash agent/env/checks.sh account | what_is_running
+# Usage: bash agent/env/checks.sh account | nothing-running
 
 set -uo pipefail   # no "-e" on purpose: run ALL checks and report, don't stop at the first failure
 
@@ -36,7 +36,7 @@ aws_count() {      # usage: aws_count "label" <aws arguments ending with --query
   count_check "$label" "$n"
 }
 
-check_what_is_running() {
+check_nothing_running() {
   aws_count "EKS clusters"     eks list-clusters --query 'length(clusters)'
   aws_count "EC2 instances"    ec2 describe-instances --filters Name=instance-state-name,Values=pending,running,stopping,stopped --query 'length(Reservations[].Instances[])'
   aws_count "NAT gateways"     ec2 describe-nat-gateways --filter Name=state,Values=pending,available --query 'length(NatGateways)'
@@ -82,17 +82,24 @@ check_pods() {
   if [[ $ok -eq 1 ]]; then pass "backend and frontend pods Running, ready, 0 restarts"; fi
 }
 
+## READY check: the image tag each Deployment is RUNNING must exist in ECR.
+## Reads the tag from the cluster, not from local files, so the branch you are on does not matter.
 check_image_tags() {
-  local pair repo file tag
-  for pair in "bako-backend:K8s/backend-deployment.yaml" "bako-frontend:K8s/frontend-deployment.yaml"; do
-    repo="${pair%%:*}"; file="${pair#*:}"
-    tag=$(grep -m1 'image:' "$file" 2>/dev/null | sed 's/.*://' | tr -d ' "')
-    if [[ -z "$tag" ]]; then fail "$repo: could not read the tag from $file"; continue; fi
+  local app repo image tag
+  for app in backend frontend; do
+    repo="bako-${app}"
+    image=$(kubectl -n bako get deploy "bako-${app}" \
+      -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+    if [ -z "$image" ]; then
+      fail "${repo}: deployment not found in cluster"
+      continue
+    fi
+    tag="${image##*:}"
     if aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$tag" \
          --region "$REGION" --profile "$PROFILE" >/dev/null 2>&1; then
-      pass "$repo:${tag:0:7} exists in ECR"
+      pass "${repo}:${tag} (running in cluster) exists in ECR"
     else
-      fail "$repo:${tag:0:7} NOT found in ECR"
+      fail "${repo}:${tag} (running in cluster) NOT found in ECR"
     fi
   done
 }
