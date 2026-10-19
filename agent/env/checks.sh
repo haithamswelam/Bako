@@ -106,9 +106,9 @@ check_image_tags() {
 
 case "${1:-}" in
   account)         check_account ;;
-  nothing-running) check_account && check_nothing-running ;;
+  nothing-running) check_account && check_nothing_running ;;
   ready)           check_account && check_context && { check_image_tags; check_argo; check_pods; } ;;
-  nothing-running) check_account && check_nothing-running ;;
+  nothing-running) check_account && check_nothing_running ;;
   *) echo "usage: $0 account | ready | nothing-running"; exit 2 ;;
 esac
 
