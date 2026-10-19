@@ -10,7 +10,7 @@
 ##   - Secrets (state files, .env, keys, tfvars) cannot be read at all.
 ##   - Pushing to main is refused by code. Force-push does not exist.
 ## ---------------------------------------------------------------
-import fnmatch, json, os, shutil, subprocess
+import fnmatch, json, os, re, shutil, subprocess
 
 MAX_TOOL_CALLS = 6          # tool calls Bako may make for one message
 MAX_HISTORY = 20            # past messages (text only) sent with each new message
@@ -93,7 +93,7 @@ def t_search_repo(repo, ctx, text):
     lines = [l for l in out.splitlines() if not is_blocked(l.split(":", 1)[0])]
     return clip("\n".join(lines[:60]) or "no matches")
 
-def t_git(repo, ctx, kind, path=""):
+def t_git(repo, ctx, kind, path="", rev=""):
     if not GIT:
         return "ERROR: git not found"
     if kind == "status":
@@ -107,8 +107,19 @@ def t_git(repo, ctx, kind, path=""):
             return "ERROR: diff needs a path"
         _, rel = safe_path(repo, path)
         cmd = [GIT, "diff", "--", rel]
+    elif kind == "branch":
+        cmd = [GIT, "branch", "--show-current"]
+    elif kind == "show":
+        ## what a commit changed. rev defaults to HEAD (the last commit); path is optional.
+        rev = (rev or "HEAD").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_./~^@-]{1,60}", rev) or rev.startswith("-"):
+            return "ERROR: rev must be HEAD, a branch name or a commit hash"
+        cmd = [GIT, "show", "--stat", "--format=fuller", rev]
+        if path:
+            _, rel = safe_path(repo, path)
+            cmd = [GIT, "show", "--format=fuller", rev, "--", rel]
     else:
-        return "ERROR: kind must be status, log, diff_stat or diff"
+        return "ERROR: kind must be status, log, diff_stat, diff, branch or show"
     out, code = run(cmd, repo)
     return clip(out or "(nothing)")
 
@@ -188,8 +199,11 @@ TOOLS = [
     tool("list_dir", "List a folder of the repo.", {"path": S}),
     tool("read_file", "Read one text file of the repo (secrets are blocked).", {"path": S}, ["path"]),
     tool("search_repo", "Find a literal text in tracked repo files.", {"text": S}, ["text"]),
-    tool("git", "Read-only git. kind: status, log, diff_stat, diff (diff needs path).",
-         {"kind": {"type": "string", "enum": ["status", "log", "diff_stat", "diff"]}, "path": S}, ["kind"]),
+    tool("git", "Read-only git. status = uncommitted changes; log = last 15 commits; diff_stat/diff = uncommitted "
+         "changes (diff needs path); branch = current branch; show = what a commit changed "
+         "(rev defaults to HEAD = the last commit; path optional for one file).",
+         {"kind": {"type": "string", "enum": ["status", "log", "diff_stat", "diff", "branch", "show"]},
+          "path": S, "rev": S}, ["kind"]),
     tool("github", "Read-only GitHub. kind: runs (recent CI runs), failed_log (needs run_id), prs.",
          {"kind": {"type": "string", "enum": ["runs", "failed_log", "prs"]}, "run_id": S}, ["kind"]),
     tool("agent_logs", "Tail the newest terraform log or agent trace from agent/env/reports.",
@@ -219,6 +233,9 @@ For anything else, say in one sentence that you only handle the Bako lab, and of
 Facts: state a fact about the lab or repo only if a tool result in this conversation shows it.
 If you did not check, say "I have not checked" and check with a tool. Never invent file contents, numbers, or results.
 Quote account numbers, tags and counts exactly as the tool printed them.
+
+Never ask the human for something a tool can find. "Last commit" means HEAD: use git show. "Current branch": git branch.
+If a tool cannot do what you need, say so in one sentence. Do not try other tools hoping one fits, and do not repeat a call.
 
 Troubleshooting: look first (agent_logs, github runs and failed_log, git, read_file), then explain the cause in plain words,
 then give the exact next step. Keep it to the smallest fix.
@@ -251,27 +268,37 @@ def run_turn(client, model, history, user_text, repo):
     ctx = {"action": None}
     tokens = 0
     reply = ""
-    for _ in range(MAX_TOOL_CALLS + 1):
+    done = set()                 # (tool, arguments) already called in this turn
+    for n in range(MAX_TOOL_CALLS + 1):
+        last = (n == MAX_TOOL_CALLS)
+        if last:                 # budget used: force a plain answer from what we already know
+            msgs.append({"role": "system", "content":
+                         "Tool budget used. Answer now from the tool results above. "
+                         "Say plainly what you could not find out. No more tools."})
         resp = client.chat.completions.create(
-            model=model, messages=msgs, tools=TOOLS, parallel_tool_calls=False)
+            model=model, messages=msgs, tools=TOOLS,
+            tool_choice="none" if last else "auto", parallel_tool_calls=False)
         tokens += getattr(resp.usage, "total_tokens", 0) or 0
         m = resp.choices[0].message
-        if not m.tool_calls:
-            reply = m.content or ""
+        if last or not m.tool_calls:
+            reply = m.content or "I could not work that out. Ask me again, more narrowly."
             break
         call = m.tool_calls[0]
         msgs.append({"role": "assistant", "content": m.content, "tool_calls": [{
             "id": call.id, "type": "function",
             "function": {"name": call.function.name, "arguments": call.function.arguments}}]})
-        try:
-            args = json.loads(call.function.arguments or "{}")
-            fn = HANDLERS.get(call.function.name)
-            result = fn(repo, ctx, **args) if fn else "ERROR: unknown tool"
-        except Exception as e:                       # tool errors go back to the model as text
-            result = f"ERROR: {e}"
+        key = (call.function.name, call.function.arguments)
+        if key in done:
+            result = "ERROR: you already made this exact call. Use its result above, or answer."
+        else:
+            done.add(key)
+            try:
+                args = json.loads(call.function.arguments or "{}")
+                fn = HANDLERS.get(call.function.name)
+                result = fn(repo, ctx, **args) if fn else "ERROR: unknown tool"
+            except Exception as e:                   # tool errors go back to the model as text
+                result = f"ERROR: {e}"
         msgs.append({"role": "tool", "tool_call_id": call.id, "content": result})
-    else:
-        reply = "I used my tool budget for this message. Ask me again, more narrowly."
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": reply})
     del history[:-MAX_HISTORY]
