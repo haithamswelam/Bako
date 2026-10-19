@@ -1,5 +1,5 @@
 ## ---------------------------------------------------------------
-## BAKO CHAT WINDOW (v1) - a thin shell around agent.py
+## BAKO CHAT WINDOW (v2) - a thin shell around agent.py and bako_chat.py
 ## It contains NO agent logic. It starts "python agent.py <mode>" as a
 ## separate process, shows what it prints, and forwards what YOU type to it.
 ## The real approval check stays inside agent.py (it compares what you typed).
@@ -9,6 +9,9 @@
 ## ---------------------------------------------------------------
 import os, queue, shutil, subprocess, sys, threading, time
 import streamlit as st
+import keyring
+from openai import OpenAI
+import bako_chat
 
 ## ---------------------------------------------------------------
 ## 1. SETTINGS
@@ -18,6 +21,18 @@ import streamlit as st
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 LOGO = os.path.join(os.path.dirname(__file__), "bako-logo.png")
 BASH = os.environ.get("AGENT_BASH") or shutil.which("bash")
+
+MODEL = os.environ.get("AGENT_MODEL", "gpt-5.4-nano")
+
+## One OpenAI client for the whole window. The key comes from the Windows
+## Credential Manager (same place agent.py reads it). None = chat falls back to keywords.
+@st.cache_resource
+def get_client():
+    try:
+        key = os.environ.get("OPENAI_API_KEY") or keyring.get_password("bako-agent", "OPENAI_API_KEY")
+    except Exception:
+        key = None
+    return OpenAI(api_key=key) if key else None
 
 st.set_page_config(page_title="Bako", page_icon="🤖")
 
@@ -33,6 +48,9 @@ ss.setdefault("proc", None)      # the running agent process
 ss.setdefault("q", None)         # lines from the process arrive in this queue
 ss.setdefault("awaiting", None)  # the approval word the agent is waiting for
 ss.setdefault("logfile", None)   # terraform log path, once apply/destroy starts
+ss.setdefault("hist", [])        # text-only history sent to the model
+ss.setdefault("pending", None)   # a proposed commit+push waiting for "push bako"
+ss.setdefault("tokens", 0)       # model tokens used in this window
 
 ## ---------------------------------------------------------------
 ## 3. HEADER
@@ -40,7 +58,7 @@ ss.setdefault("logfile", None)   # terraform log path, once apply/destroy starts
 if os.path.exists(LOGO):
     st.image(LOGO, width=110)
 st.title("Bako")
-st.caption("Your lab assistant. Say: start, stop or status.")
+st.caption("Talk to me about the Bako lab: status, errors, the repo, start, stop, push.")
 
 ## ---------------------------------------------------------------
 ## 4. TALKING TO THE AGENT PROCESS
@@ -92,7 +110,7 @@ def drain():
 def say(text):
     ss.chat.append(("assistant", text))
 
-def handle(text):
+def handle_keywords(text):
     t = text.lower()
     words = set(t.replace(",", " ").replace("!", " ").replace("?", " ").split())
     if any(w in t for w in ("stop", "destroy", "shut down", "tear down")):
@@ -114,6 +132,35 @@ def handle(text):
         say("Hi Haitham! I can **start** the lab, **stop** it, or show its **status**. What would you like?")
     else:
         say("I only know three things for now: **start**, **stop** and **status**.")
+
+## v2 router: the model understands the sentence and may use read-only tools.
+## It can only PROPOSE actions. Starting, stopping and pushing still wait for your typed word.
+def handle(text):
+    client = get_client()
+    if client is None:
+        say("No OpenAI key found, so I use the simple keyword mode. Say: start, stop or status.")
+        return handle_keywords(text)
+    try:
+        with st.spinner("Bako is thinking..."):
+            reply, action, used = bako_chat.run_turn(client, MODEL, ss.hist, text, REPO)
+    except Exception as e:
+        say(f"The model is not reachable ({type(e).__name__}). Keyword mode: say start, stop or status.")
+        return handle_keywords(text)
+    ss.tokens += used
+    say(reply or "(no reply)")
+    if action:
+        apply_action(action)
+
+## Turn a proposal into the matching flow. Nothing here skips the typed approval.
+def apply_action(action):
+    if action["type"] == "start":
+        say("Opening the START flow. I will plan first, then ask you to approve.")
+        launch("start")
+    elif action["type"] == "stop":
+        say("Opening the STOP flow. I will plan the destroy first, then ask you to approve.")
+        launch("stop")
+    elif action["type"] == "commit_push":
+        ss.pending = action
 
 ## ---------------------------------------------------------------
 ## 6. DRAWING THE SCREEN
@@ -148,6 +195,13 @@ if finished:
     ss.proc, ss.log, ss.awaiting, ss.logfile = None, [], None, None
     st.rerun()
 
+## A proposed commit + push waits here until you type "push bako".
+if ss.pending:
+    a = ss.pending
+    st.warning(f'Bako proposes to commit to the NEW branch "{a["branch"]}" and push it.\n\n'
+               f'Message: {a["message"]}\n\nFiles: ' + ", ".join(a["files"]) +
+               '\n\nType exactly "push bako" to do it. Anything else cancels.')
+
 ## If the agent is waiting for approval, say so clearly.
 if ss.awaiting and ss.proc is not None:
     st.warning(f'The agent is waiting for your approval. Type exactly "{ss.awaiting}" '
@@ -161,7 +215,13 @@ if ss.awaiting and ss.proc is not None:
 prompt = st.chat_input("Talk to Bako...")
 if prompt:
     ss.chat.append(("user", prompt))
-    if ss.proc is not None and ss.awaiting:
+    if ss.pending:
+        action, ss.pending = ss.pending, None
+        if prompt.strip() == "push bako":
+            say("```\n" + bako_chat.do_commit_push(REPO, action) + "\n```")
+        else:
+            say("Cancelled. Nothing was committed or pushed.")
+    elif ss.proc is not None and ss.awaiting:
         try:
             ss.proc.stdin.write(prompt.strip() + "\n")
             ss.proc.stdin.flush()
@@ -174,6 +234,8 @@ if prompt:
     else:
         handle(prompt)
     st.rerun()
+
+st.caption(f"Model tokens used in this window: {ss.tokens}")
 
 ## While a run is active, look again every second.
 if ss.proc is not None:
