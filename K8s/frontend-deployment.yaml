@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: bako-frontend
-          image: 483272865934.dkr.ecr.eu-north-1.amazonaws.com/bako-frontend:0833931c6c55364119a5b719b7ac677a346ab7f1
+          image: 483272865934.dkr.ecr.eu-north-1.amazonaws.com/bako-frontend:5bb956775c7e363ffda76c89d7097134ea4871e4
           ports:
             - containerPort: 80
           resources:
