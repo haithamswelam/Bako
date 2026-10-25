@@ -52,7 +52,8 @@ kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.pas
 echo
 echo
 echo "Done. Run: kubectl get applications -n argocd   (watch for Synced/Healthy)"
-echo "Then:      kubectl port-forward svc/argocd-server -n argocd 8081:443"
+echo "Then:      kubectl port-forward svc/argocd-server -n argocd 8087:443"
+echo "Then open: https://localhost:8087   (user: admin)"
 echo
 echo
 echo " Check Cluster is up and running"

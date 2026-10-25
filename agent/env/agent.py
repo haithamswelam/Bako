@@ -5,6 +5,7 @@
 import json, os, shutil, subprocess, sys, time
 from openai import OpenAI
 import keyring
+import redact                         # hides secrets before they reach the trace or the model
 MODEL = os.environ.get("AGENT_MODEL", "gpt-5.4-nano")
 API_KEY = os.environ.get("OPENAI_API_KEY") or keyring.get_password("bako-agent", "OPENAI_API_KEY")
 if not API_KEY:
@@ -18,7 +19,8 @@ MAX_SECONDS = 60 * 60                 # max run time: 60 minutes
 ##   plan_ok      = True after a clean plan (no deletes) in this run
 ##   plan_summary = the plan summary shown to the human before apply
 STATE = {"account_ok": False, "plan_ok": False, "plan_summary": "", "applied": False, "stop_now": "",
-         "destroy_plan_ok": False, "destroy_summary": "", "destroyed": False, "nothing_running": False}
+         "destroy_plan_ok": False, "destroy_summary": "", "destroyed": False, "nothing_running": False,
+         "ready": False, "stopped_at": "", "plan_counts": {}}
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "dry"
 if MODE not in ("dry", "start", "stop"):
@@ -29,6 +31,18 @@ BASH = os.environ.get("AGENT_BASH") or shutil.which("bash")
 if not BASH:
     raise SystemExit("bash not found")
 print(f"using bash: {BASH}")
+import shellenv                      # lets bash find grep, awk, base64 (Git's usr/bin) when started from Python
+UNIX_ENV = shellenv.unix_env(BASH, {k: v for k, v in os.environ.items() if k != "KUBECONFIG"})
+
+## "start --from <step>" re-runs START from one step after terraform apply (the lab must already exist).
+ORDER = ["boot", "trig", "bot", "merge", "argo", "ready"]
+ALIAS = {"test": "trig", "build": "trig", "push": "trig"}
+FROM = ""
+if "--from" in sys.argv:
+    i = sys.argv.index("--from")
+    FROM = ALIAS.get(sys.argv[i + 1], sys.argv[i + 1]) if i + 1 < len(sys.argv) else ""
+    if MODE != "start" or FROM not in ORDER:
+        raise SystemExit("usage: python agent/env/agent.py start --from " + "|".join(ORDER))
 
 
 ## ---------------------------------------------------------------
@@ -50,10 +64,20 @@ def trace(**event):
 ## The model's report is prose. This line is the facts.
 ## ---------------------------------------------------------------
 def print_verdict():
-    if MODE in ("dry", "start"):
+    if MODE == "dry":
         print("\nRESULT (from code):", "APPLIED" if STATE["applied"] else "NOT APPLIED",
               "| plan clean:", STATE["plan_ok"], "| account ok:", STATE["account_ok"])
         trace(event="outcome", applied=STATE["applied"], plan_ok=STATE["plan_ok"])
+    if MODE == "start":
+        where = STATE["stopped_at"] or "unknown"
+        if STATE["ready"]:
+            word = "READY"
+        elif STATE["applied"]:
+            word = "APPLIED, NOT READY | stopped at: " + where
+        else:
+            word = "NOT APPLIED | stopped at: " + where
+        print("\nRESULT (from code):", word, "| account ok:", STATE["account_ok"])
+        trace(event="outcome", applied=STATE["applied"], ready=STATE["ready"], stopped_at=STATE["stopped_at"])
     if MODE == "stop":
         print("\nRESULT (from code):", "NOTHING RUNNING" if STATE["nothing_running"] else "NOT CLEAN or NOT DESTROYED",
               "| destroyed:", STATE["destroyed"])
@@ -70,7 +94,7 @@ def tool_run_checks(kind):
     if kind not in ("account", "ready", "nothing-running"):
         return "ERROR: unknown check"
     proc = subprocess.run(
-        [BASH, "agent/env/checks.sh", kind], capture_output=True, text=True
+        [BASH, "agent/env/checks.sh", kind], capture_output=True, text=True, env=UNIX_ENV
     )
     if kind == "account" and proc.returncode == 0:
         STATE["account_ok"] = True
@@ -122,6 +146,7 @@ def tool_terraform_plan():
     if counts["delete"] > 0:
         summary += "\nWARNING: this plan deletes or replaces resources."
     STATE["plan_ok"] = counts["delete"] == 0   # clean plan = no deletes
+    STATE["plan_counts"] = dict(counts)
     STATE["plan_summary"] = summary
     return summary
 
@@ -337,6 +362,511 @@ def show(name, result):
     trace(event="step_result", step=name, result=result[:2000])
     print(result)
 
+## ---------------------------------------------------------------
+## 8b-START. THE FULL START SEQUENCE (plain code, the model is not called)
+## One fixed order. Each step reports a "stage" line in the trace, so the
+## dashboard's Flow tab can colour its boxes from facts, not from prose:
+##   acct -> plan -> appr -> apply -> boot (kubeconfig + bootstrap script; the cluster must be up first)
+##   trig -> test -> build -> push (GitHub CI) -> bot (pull request)
+##   -> merge (YOU click it on GitHub) -> argo -> ready
+## Humans decide twice: the typed word "approved" before apply, and the
+## merge of the bot pull request. Code never merges for you.
+## ---------------------------------------------------------------
+import re
+from datetime import datetime, timezone
+
+def read_setting(name, fallback):
+    ## Reads NAME=value from checks.sh, so these settings live in one place.
+    try:
+        with open("agent/env/checks.sh", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"^\s*" + name + r"=(.*)$", line.strip())
+                if m:
+                    value = m.group(1).split("#")[0].strip().strip("\"'")
+                    d = re.search(r":-([^}]*)\}", value)
+                    value = d.group(1) if d else value
+                    if value and "$" not in value:
+                        return value
+    except OSError:
+        pass
+    return fallback
+
+REGION = read_setting("REGION", "eu-north-1")
+PROFILE = read_setting("PROFILE", "")
+EXPECTED_ACCOUNT = read_setting("EXPECTED_ACCOUNT", "483272865934")
+CLUSTER = os.environ.get("BAKO_CLUSTER", "bako-eks")
+ARGO_APP = os.environ.get("BAKO_ARGO_APP", "bako")
+ECR_REPOS = ["bako-backend", "bako-frontend"]
+POLL = float(os.environ.get("AGENT_POLL_SECONDS", "15"))        # seconds between checks
+## kubectl and aws must not see a stray KUBECONFIG (it overrides ~/.kube/config)
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "KUBECONFIG"}
+
+GH = shutil.which("gh")
+AWSCLI = shutil.which("aws")
+KUBECTL = shutil.which("kubectl")
+
+def run_cmd(cmd, timeout=120, env=None, stdout_only=False):
+    ## Never raises: returns (exit code, output). Never waits for keyboard input.
+    ## stdout_only=True is for commands whose output we parse as JSON: a warning on stderr must not break it.
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL, env=env)
+        return p.returncode, (p.stdout or "") + ("" if stdout_only else (p.stderr or ""))
+    except subprocess.TimeoutExpired:
+        return 124, f"TIMED OUT after {timeout}s: {' '.join(cmd[:3])}"
+    except OSError as e:
+        return 127, f"cannot run {cmd[0]}: {e}"
+
+def aws_cmd(*args):
+    cmd = [AWSCLI, *args, "--region", REGION]
+    if PROFILE and not os.environ.get("AWS_PROFILE"):
+        cmd += ["--profile", PROFILE]
+    return cmd
+
+def stage(sid, status, detail=""):
+    ## status: running | done | failed | waiting | skipped
+    detail = redact.redact(detail)
+    trace(event="stage", id=sid, status=status, detail=detail[:1500])
+    print(f"[{sid}] {status.upper()}" + (f": {detail}" if detail else ""))
+
+def fail(sid, detail):
+    stage(sid, "failed", detail)
+    STATE["stopped_at"] = sid
+    return False
+
+def wait_for(fn, timeout_s, label=""):
+    ## Calls fn() every POLL seconds until it returns something other than None, or time runs out.
+    t0 = time.time()
+    while True:
+        value = fn()
+        if value is not None:
+            return value
+        if time.time() - t0 > timeout_s:
+            return None
+        time.sleep(POLL)
+
+def preflight_start():
+    ## Cheap checks BEFORE any money is spent: everything later steps need must exist.
+    problems = []
+    for name, path in (("gh", GH), ("aws", AWSCLI), ("kubectl", KUBECTL)):
+        if not path:
+            problems.append(f"{name} was not found on this computer")
+    if not os.path.exists("bootstrap-cluster.sh"):
+        problems.append("bootstrap-cluster.sh was not found in the repo root")
+    if not os.path.exists(".github/workflows/ci.yml"):
+        problems.append(".github/workflows/ci.yml was not found")
+    if GH:
+        rc, out = run_cmd([GH, "auth", "status"], 30)
+        if rc != 0:
+            problems.append("gh is not signed in. Run: gh auth login")
+    ## the shell that will run bootstrap-cluster.sh must find every tool the script uses
+    rc, out = run_cmd([BASH, "-c", "for t in grep awk base64 helm aws kubectl; do command -v $t >/dev/null 2>&1 || echo $t; done"],
+                      30, UNIX_ENV)
+    missing = out.split()
+    if rc != 0 or missing:
+        problems.append("the shell that runs bootstrap-cluster.sh cannot find: " + (", ".join(missing) or out.strip()[:200]))
+    return problems
+
+def main_sha():
+    rc, out = run_cmd([GH, "api", "repos/:owner/:repo/commits/main", "--jq", ".sha"], 30, stdout_only=True)
+    sha = out.strip()
+    return sha if rc == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else ""
+
+def ecr_has(repo, tag):
+    rc, _ = run_cmd(aws_cmd("ecr", "describe-images", "--repository-name", repo,
+                            "--image-ids", f"imageTag={tag}"), 60, CLEAN_ENV)
+    return rc == 0
+
+def images_exist(tag):
+    return all(ecr_has(repo, tag) for repo in ECR_REPOS)
+
+def deployed_tags():
+    ## The image tags that the manifests in K8s/ on main point at: {"bako-backend": tag, ...}.
+    ## Empty when we cannot tell for sure (then START simply builds, which is always safe).
+    rc, out = run_cmd([GH, "api", "repos/:owner/:repo/git/trees/main?recursive=1", "--jq", ".tree[].path"],
+                      60, stdout_only=True)
+    if rc != 0:
+        return {}
+    files = [p for p in out.splitlines() if p.lower().startswith("k8s/") and p.lower().endswith((".yaml", ".yml"))]
+    found = {repo: set() for repo in ECR_REPOS}
+    for path in files[:80]:
+        rc, body = run_cmd([GH, "api", f"repos/:owner/:repo/contents/{path}?ref=main",
+                            "-H", "Accept: application/vnd.github.raw"], 60, stdout_only=True)
+        if rc != 0:
+            continue
+        for repo in ECR_REPOS:
+            for m in re.finditer(re.escape(repo) + r":([A-Za-z0-9_.-]+)", body):
+                found[repo].add(m.group(1))
+    if all(len(tags) == 1 for tags in found.values()):
+        return {repo: next(iter(tags)) for repo, tags in found.items()}
+    return {}
+
+def step_cluster_access():
+    ## Point kubectl at the new cluster, and refuse to go on if it is the wrong one.
+    rc, out = run_cmd(aws_cmd("eks", "update-kubeconfig", "--name", CLUSTER), 120, CLEAN_ENV)
+    if rc != 0:
+        return fail("boot", "aws eks update-kubeconfig failed:\n" + out[-800:])
+    rc, ctx = run_cmd([KUBECTL, "config", "current-context"], 30, CLEAN_ENV)
+    ctx = ctx.strip()
+    if rc != 0 or not ctx.endswith(f"{EXPECTED_ACCOUNT}:cluster/{CLUSTER}"):
+        return fail("boot", f"kubectl context is '{ctx}', expected one ending in {EXPECTED_ACCOUNT}:cluster/{CLUSTER}. Nothing was changed in the cluster.")
+    return True
+
+def step_bootstrap():
+    log_path = f"agent/env/reports/bootstrap-{time.strftime('%Y%m%d-%H%M%S')}.log"
+    print(f"Bootstrap started (Argo CD, External Secrets, the app). Log: {log_path}")
+    try:
+        with open(log_path, "w") as log:
+            p = subprocess.run([BASH, "bootstrap-cluster.sh"], stdout=log, stderr=subprocess.STDOUT,
+                               text=True, timeout=25 * 60, stdin=subprocess.DEVNULL, env=UNIX_ENV)
+    except subprocess.TimeoutExpired:
+        return fail("boot", f"bootstrap-cluster.sh timed out after 25 minutes. Log: {log_path}")
+    if p.returncode != 0:
+        tail = open(log_path, errors="replace").read()[-1200:]
+        return fail("boot", f"bootstrap-cluster.sh failed (exit {p.returncode}). Log: {log_path}\n{tail}")
+    return True
+
+def group_status(items):
+    ## items: list of (status, conclusion). Returns done | running | failed | waiting.
+    if not items:
+        return "waiting"
+    if any(c in ("failure", "cancelled", "timed_out", "startup_failure") for _, c in items):
+        return "failed"
+    if any(s in ("in_progress", "queued", "waiting", "pending") and c in (None, "") for s, c in items):
+        return "running" if any(s == "in_progress" for s, _ in items) else "waiting"
+    if all(c in ("success", "skipped", "neutral") for _, c in items):
+        return "done"
+    return "waiting"
+
+def ci_stages(run_json):
+    ## Turns a GitHub run into the Flow boxes: test, build, push.
+    ## Jobs whose name has "build" or "push" feed build/push (by step name);
+    ## every other job is a test job.
+    tests, build, push, whole = [], [], [], []
+    for job in run_json.get("jobs", []):
+        name = job.get("name", "").lower()
+        item = (job.get("status"), job.get("conclusion"))
+        if "build" in name or "push" in name:
+            whole.append(item)
+            for st in job.get("steps", []):
+                sname = st.get("name", "").lower()
+                sitem = (st.get("status"), st.get("conclusion"))
+                if re.search(r"credential|login|push|ecr", sname):
+                    push.append(sitem)
+                elif re.search(r"build|docker|image", sname):
+                    build.append(sitem)
+        elif job.get("conclusion") != "skipped":
+            tests.append(item)
+    if whole and not build and not push:
+        build, push = whole, whole
+    return {"test": group_status(tests), "build": group_status(build), "push": group_status(push)}
+
+def wait_for_ci(run_id):
+    ## Polls the run until it finishes. Returns (finished, conclusion, run_json).
+    last = {}
+    def poll():
+        rc, out = run_cmd([GH, "run", "view", str(run_id), "--json", "status,conclusion,jobs,headSha,url"], 60, stdout_only=True)
+        if rc != 0:
+            return None
+        try:
+            data = json.loads(out)
+        except ValueError:
+            return None
+        for sid, st in ci_stages(data).items():
+            if st == "waiting" and data.get("status") == "completed" and data.get("conclusion") == "success":
+                st = "skipped"                  # this workflow has no job for that box
+            if last.get(sid) != st:
+                last[sid] = st
+                stage(sid, st)
+        return data if data.get("status") == "completed" else None
+    data = wait_for(poll, 25 * 60)
+    if data is None:
+        return False, "timeout", {}
+    return True, data.get("conclusion"), data
+
+def failed_ci_report(run_id, data):
+    bad = []
+    for job in data.get("jobs", []):
+        for st in job.get("steps", []):
+            if st.get("conclusion") == "failure":
+                bad.append(f"{job.get('name')} / {st.get('name')}")
+    rc, log = run_cmd([GH, "run", "view", str(run_id), "--log-failed"], 60)
+    return ("Failed step: " + "; ".join(bad) if bad else "Failed") + f"\nRun: {data.get('url', '')}\n" + log[-1200:]
+
+def step_build():
+    ## Trigger ci.yml on main (or skip when this commit's images already exist), then follow it.
+    ## 1. Do the manifests on main already point at images that exist? Then there is nothing to build or merge.
+    tags = deployed_tags()
+    if tags and all(ecr_has(repo, tag) for repo, tag in tags.items()):
+        for sid in ("trig", "test", "build", "push"):
+            stage(sid, "skipped", "the images the cluster needs already exist in ECR (" + next(iter(tags.values()))[:7] + ")")
+        STATE["reuse"] = True
+        return True
+    ## 2. Were images for the newest commit already built (the bot pull request may be waiting)?
+    sha = main_sha()
+    if not sha:
+        return fail("trig", "could not read the latest commit on main from GitHub")
+    sha7 = sha[:7]
+    STATE["sha7"] = sha7
+    if images_exist(sha) or images_exist(sha7):
+        for sid in ("trig", "test", "build", "push"):
+            stage(sid, "skipped", f"images for {sha7} already exist in ECR")
+        return True
+    since = datetime.now(timezone.utc).timestamp() - 60
+    rc, out = run_cmd([GH, "workflow", "run", "ci.yml", "--ref", "main"], 60)
+    if rc != 0:
+        return fail("trig", "gh workflow run failed:\n" + out[-800:])
+    def find_run():
+        rc, out = run_cmd([GH, "run", "list", "--workflow", "ci.yml", "--branch", "main",
+                           "--event", "workflow_dispatch", "--limit", "5", "--json", "databaseId,createdAt,url"], 60, stdout_only=True)
+        if rc != 0:
+            return None
+        try:
+            for r in json.loads(out or "[]"):
+                made = datetime.strptime(r["createdAt"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+                if made >= since:
+                    return r
+        except (ValueError, KeyError):
+            return None
+        return None
+    run_info = wait_for(find_run, 3 * 60)
+    if not run_info:
+        return fail("trig", "the build was requested but no run appeared within 3 minutes")
+    STATE["run_id"] = run_info["databaseId"]
+    stage("trig", "done", run_info.get("url", ""))
+    return True
+
+def finish_build():
+    ## Waits for the run. One automatic retry when AWS had not yet accepted the new role.
+    if "run_id" not in STATE:
+        return True              # build was skipped
+    run_id = STATE["run_id"]
+    for attempt in (1, 2):
+        finished, conclusion, data = wait_for_ci(run_id)
+        if not finished:
+            return fail("build", "the build did not finish within 25 minutes")
+        if conclusion == "success":
+            return True
+        report = failed_ci_report(run_id, data)
+        if attempt == 1 and re.search(r"credential|assume|oidc", report, re.I):
+            wait_s = float(os.environ.get("AGENT_RETRY_WAIT", "60"))
+            print(f"The AWS role may not be active yet (new roles take about a minute). Waiting {wait_s:.0f}s, then re-running the failed job once.")
+            trace(event="retry", what="ci rerun", run=run_id)
+            time.sleep(wait_s)
+            rc, out = run_cmd([GH, "run", "rerun", str(run_id), "--failed"], 60)
+            if rc == 0:
+                continue
+        bad = [k for k, v in ci_stages(data).items() if v == "failed"]
+        return fail(bad[0] if bad else "build", report)
+    return False
+
+def step_bot_pr():
+    branch = f"deploy/image-{STATE['sha7']}"          # the bot adds "-<run id>" after this
+    def find():
+        rc, out = run_cmd([GH, "pr", "list", "--state", "all", "--limit", "30",
+                           "--json", "number,state,url,mergeCommit,headRefName"], 60, stdout_only=True)
+        if rc != 0:
+            return None
+        try:
+            prs = json.loads(out or "[]")
+        except ValueError:
+            return None
+        mine = [p for p in prs if re.fullmatch(re.escape(branch) + r"(-\d+)?", p.get("headRefName", ""))]
+        mine.sort(key=lambda p: p["number"], reverse=True)       # newest first
+        live = [p for p in mine if p["state"] != "CLOSED"]
+        return (live or mine or [None])[0]
+    pr = wait_for(find, 10 * 60)
+    if not pr:
+        return fail("bot", f"no pull request from branch {branch} appeared within 10 minutes")
+    STATE["pr"] = pr
+    stage("bot", "done", f"#{pr['number']} {pr['url']}")
+    return True
+
+def adopt_latest_bot_pr():
+    ## Used when START is resumed after the build: take the newest open (or merged) bot pull request.
+    rc, out = run_cmd([GH, "pr", "list", "--state", "all", "--limit", "30",
+                       "--json", "number,state,url,mergeCommit,headRefName"], 60, stdout_only=True)
+    try:
+        prs = [p for p in json.loads(out or "[]") if p.get("headRefName", "").startswith("deploy/image-")]
+    except ValueError:
+        prs = []
+    prs.sort(key=lambda p: p["number"], reverse=True)
+    live = [p for p in prs if p["state"] != "CLOSED"]
+    pr = (live or [None])[0]
+    if not pr:
+        return fail("bot", "no open or merged bot pull request found. Press Start to build a new one.")
+    STATE["pr"] = pr
+    stage("bot", "done", f"#{pr['number']} {pr['url']}")
+    return True
+
+def step_merge_gate():
+    ## The human gate. We only watch; the merge happens on GitHub, by you.
+    pr = STATE["pr"]
+    n = pr["number"]
+    if pr["state"] == "MERGED":
+        STATE["merge_oid"] = (pr.get("mergeCommit") or {}).get("oid", "")
+        stage("merge", "skipped", f"#{n} was already merged")
+        return True
+    rc, checks = run_cmd([GH, "pr", "checks", str(n)], 60)
+    print(f"\n=== ACTION FOR YOU ===\nMerge pull request #{n}: {pr['url']}\nChecks:\n{checks.strip()[:800]}")
+    stage("merge", "running", f"waiting for you to merge #{n}")
+    waited = {"t": time.time()}
+    def merged():
+        rc, out = run_cmd([GH, "pr", "view", str(n), "--json", "state,mergeCommit"], 60, stdout_only=True)
+        if rc != 0:
+            return None
+        try:
+            d = json.loads(out)
+        except ValueError:
+            return None
+        if d.get("state") == "MERGED":
+            return d
+        if d.get("state") == "CLOSED":
+            return d
+        if time.time() - waited["t"] > 300:
+            waited["t"] = time.time()
+            print(f"Still waiting for you to merge #{n}.")
+        return None
+    d = wait_for(merged, 45 * 60)
+    if d is None:
+        return fail("merge", f"pull request #{n} was not merged within 45 minutes")
+    if d["state"] == "CLOSED":
+        return fail("merge", f"pull request #{n} was closed without merging")
+    STATE["merge_oid"] = (d.get("mergeCommit") or {}).get("oid", "")
+    stage("merge", "done", f"#{n} merged")
+    return True
+
+def step_argo():
+    ## Argo must be Synced and Healthy AT the merged commit (not at yesterday's).
+    stage("argo", "running", "refreshing the application")
+    run_cmd([KUBECTL, "-n", "argocd", "annotate", "application", ARGO_APP,
+             "argocd.argoproj.io/refresh=hard", "--overwrite"], 60, CLEAN_ENV)
+    want = STATE.get("merge_oid", "")
+    seen = {"s": ""}
+    def ok():
+        rc, out = run_cmd([KUBECTL, "-n", "argocd", "get", "application", ARGO_APP, "-o", "json"], 60, CLEAN_ENV, stdout_only=True)
+        if rc != 0:
+            return None
+        try:
+            st = json.loads(out).get("status", {})
+        except ValueError:
+            return None
+        sync, health = st.get("sync", {}).get("status"), st.get("health", {}).get("status")
+        rev = st.get("sync", {}).get("revision", "")
+        line = f"{sync}/{health} at {rev[:7]}"
+        if line != seen["s"]:
+            seen["s"] = line
+            print("Argo CD:", line)
+        if sync == "Synced" and health == "Healthy" and (not want or rev == want):
+            return line
+        return None
+    result = wait_for(ok, 15 * 60)
+    if not result:
+        return fail("argo", f"Argo CD did not reach Synced/Healthy at {want[:7]} in 15 minutes (last: {seen['s']})")
+    stage("argo", "done", result)
+    return True
+
+def step_ready():
+    stage("ready", "running", "running the READY checks")
+    out = {"text": ""}
+    def good():
+        out["text"] = tool_run_checks("ready")
+        return True if out["text"].rstrip().endswith("exit code: 0") else None
+    if wait_for(good, 5 * 60):
+        STATE["ready"] = True
+        stage("ready", "done")
+        print(out["text"])
+        return True
+    print(out["text"])
+    return fail("ready", "the READY checks did not all pass within 5 minutes:\n" + out["text"][-800:])
+
+def run_start():
+    problems = preflight_start()
+    if problems:
+        print("STOP: START cannot run yet. Nothing was changed.")
+        for p in problems:
+            print(" -", p)
+        stage("pre", "failed", "; ".join(problems))
+        STATE["stopped_at"] = "preflight"
+        return
+    stage("acct", "done")
+    if FROM:
+        print(f"\n>> Resuming START from '{FROM}'. Plan and apply are not repeated.")
+        for sid in ("plan", "appr", "apply"):
+            stage(sid, "skipped", "done in an earlier run")
+        STATE["applied"] = True
+        run_tail(ORDER.index(FROM))
+        return
+    stage("plan", "running")
+    print("\n>> Planning (read-only)")
+    show("terraform_plan", tool_terraform_plan())
+    if not STATE["plan_ok"]:
+        fail("plan", "the plan is not clean. Nothing was applied.")
+        return
+    stage("plan", "done", STATE["plan_summary"][:200])
+    counts = STATE.get("plan_counts", {})
+    if counts and not any(counts.values()):
+        STATE["applied"] = True
+        stage("appr", "skipped", "nothing to apply, the lab already exists")
+        stage("apply", "skipped", "no changes")
+    else:
+        stage("appr", "running", "waiting for your typed word")
+        print("\n>> Apply (needs your typed approval)")
+        show("terraform_apply", tool_terraform_apply())
+        if STATE["stop_now"] == "human did not approve":
+            fail("appr", "you did not type approved. Nothing was applied.")
+            return
+        stage("appr", "done")
+        stage("apply", "running")
+        if not STATE["applied"]:
+            fail("apply", STATE["stop_now"] or "apply did not finish")
+            return
+        stage("apply", "done")
+    run_tail(0)
+
+def run_tail(first):
+    ## Everything after terraform apply. first = position in ORDER to begin at (0 = from the bootstrap).
+    ## Steps before it are shown as skipped ("done in an earlier run").
+    boxes = {"boot": ["boot"], "trig": ["trig", "test", "build", "push"], "bot": ["bot"],
+             "merge": ["merge"], "argo": ["argo"], "ready": ["ready"]}
+    for key in ORDER[:first]:
+        for sid in boxes[key]:
+            stage(sid, "skipped", "done in an earlier run")
+    if first == 0:
+        stage("boot", "running", "kubectl access and bootstrap script")
+    if not step_cluster_access():              # also proves the lab exists: fails if the cluster is gone
+        return
+    if first == 0:
+        if not step_bootstrap():               # the cluster must be up BEFORE GitHub builds anything
+            return
+        stage("boot", "done")
+    if first <= 1:
+        if not step_build():
+            return
+        if not finish_build():
+            return
+    if STATE.get("reuse"):
+        stage("bot", "skipped", "the manifests already point at images that exist")
+        stage("merge", "skipped", "nothing to merge")
+        STATE["merge_oid"] = ""
+    else:
+        if first <= 2:
+            ok = step_bot_pr() if "sha7" in STATE else adopt_latest_bot_pr()
+            if not ok:
+                return
+        elif first <= 3:
+            if not adopt_latest_bot_pr():
+                return
+        if first <= 3:
+            if not step_merge_gate():
+                return
+        else:
+            STATE["merge_oid"] = ""            # resumed later: any revision is fine, it must be Synced and Healthy
+    if first <= 4:
+        if not step_argo():
+            return
+    step_ready()
+
 if MODE == "stop":
     print("\n>> Planning the destroy (read-only)")
     show("terraform_plan_destroy", tool_terraform_plan_destroy())
@@ -350,16 +880,10 @@ if MODE == "stop":
     raise SystemExit(0 if (STATE["destroyed"] and STATE["nothing_running"]) else 1)
 
 if MODE == "start":
-    print("\n>> Planning (read-only)")
-    show("terraform_plan", tool_terraform_plan())
-    if STATE["plan_ok"]:
-        print("\n>> Apply (needs your typed approval)")
-        show("terraform_apply", tool_terraform_apply())
-    else:
-        print("STOP: the plan is not clean. Nothing was applied.")
+    run_start()
     trace(event="stop", reason="start sequence finished")
     print_verdict()
-    raise SystemExit(0 if STATE["applied"] else 1)
+    raise SystemExit(0 if STATE["ready"] else 1)
 
 ## ---------------------------------------------------------------
 ## 9. THE AGENT LOOP
