@@ -11,6 +11,7 @@
 ##   - Pushing to main is refused by code. Force-push does not exist.
 ## ---------------------------------------------------------------
 import datetime, fnmatch, json, os, re, shutil, subprocess, time
+import usage                 # price of tokens, for the cost budget of one message
 import redact                # hides passwords, tokens and keys before text goes to the model
 import shellenv              # lets bash find grep, awk, base64 when started from Python on Windows
 
@@ -23,12 +24,12 @@ MAX_OUT = 12000             # characters of any tool output sent to the model (t
 ##   - tool output is cut at 4,000 characters instead of 12,000
 ##   - GitHub runs come with labelled columns and a failure summary; log noise is removed
 ##   - clearer tool descriptions and a few extra rules (what "flow" means, how old a failure is)
-##   - a token budget per message: past TURN_TOKEN_BUDGET tokens, Bako must answer with what it has
+##   - a cost budget per message (default $0.01, about 5 times a normal question): past it, Bako must answer with what it has
 LEAN = os.environ.get("BAKO_LEAN", "1") != "0"
 MAX_OUT_LEAN = 4000
 MAX_HISTORY_LEAN = 10       # earlier messages sent with each new one (the old mode sends 20)
 HISTORY_REPLY_CAP = 600     # an earlier answer longer than this is cut when it is sent again
-TURN_TOKEN_BUDGET = 12000
+TURN_COST_BUDGET = float(os.environ.get("BAKO_TURN_BUDGET", "0.01"))   # dollars one message may spend before Bako must answer
 
 ## The tools used in the LAST turn, for the dashboard's Flow tab (read-only record, nothing else uses it).
 ## Each item: {"name": tool name, "ok": True/False, "detail": first 300 characters of the result}
@@ -307,22 +308,52 @@ def t_propose_stop(repo, ctx):
     ctx["action"] = {"type": "stop"}
     return "Proposal sent to the human. The STOP flow will open; it plans first and needs the typed words 'destroy bako'."
 
-def t_propose_commit_push(repo, ctx, branch, message, files):
+def _changed_files(repo):
+    """{path: 'new' | 'modified' | 'deleted' | 'renamed'} for everything git sees as changed, one entry per file."""
+    out, _ = run([GIT, "status", "--porcelain", "-uall"], repo)
+    res = {}
+    for l in out.splitlines():
+        if len(l) < 4:
+            continue
+        xy, path = l[:2], l[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ")[-1]
+        res[path] = ("new" if xy == "??" or "A" in xy else "deleted" if "D" in xy else "renamed" if "R" in xy else "modified")
+    return res
+
+def t_propose_commit_push(repo, ctx, message="", files=None, branch=None):
+    ## The BRANCH NAME and the FILE LIST come from code, not from the model:
+    ##   - the branch is bako/update-<date>-<time> (a model-chosen name is ignored)
+    ##   - the files are what git really reports as changed (blocked files left out); a list from the model can only narrow it
     if not GIT:
         return "ERROR: git not found"
-    if branch in ("main", "master") or not branch.strip() or " " in branch:
-        return "ERROR: use a new feature branch name without spaces (never main or master)"
-    if not message.strip() or not files:
-        return "ERROR: need a commit message and an explicit list of files"
-    status, _ = run([GIT, "status", "--porcelain"], repo)
-    changed = {l[3:].strip().strip('"') for l in status.splitlines()}
-    for f in files:
-        if f not in changed:
-            return f"ERROR: {f} has no changes (git status does not list it)"
-        if is_blocked(f):
-            return f"ERROR: {f} is blocked (secrets or generated files)"
-    ctx["action"] = {"type": "commit_push", "branch": branch, "message": message, "files": list(files)}
-    return "Proposal sent to the human. It runs only after they type 'push bako'."
+    changed = {f: l for f, l in _changed_files(repo).items() if not is_blocked(f)}
+    if not changed:
+        head, _ = run([GIT, "status", "-sb"], repo)
+        first = head.splitlines()[0] if head else ""
+        return ("NOTHING TO COMMIT: the working tree is clean, so every change is already committed. "
+                f"Git says: {first}. A branch shown with an origin/ name is already pushed. "
+                "Do not propose again. Tell the human it is already pushed, and that the next step is a pull request on GitHub.")
+    wanted = [f for f in (files or [])]
+    names = [f for f in wanted if f in changed] if wanted else list(changed)
+    skipped = [f for f in wanted if f not in changed]
+    if not names:
+        return "ERROR: none of the files you listed has changes. Changed files: " + ", ".join(list(changed)[:30])
+    branch = "bako/update-" + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    ctx["action"] = {"type": "commit_push", "branch": branch, "message": (message or "").strip() or "Update Bako files",
+                     "files": names, "file_status": {f: changed[f] for f in names}}
+    note = f" ({len(skipped)} listed file(s) had no changes and were left out)" if skipped else ""
+    return (f"Proposal sent to the human: {len(names)} file(s) to the new branch {branch}{note}. "
+            "The window shows the file list. It runs only after they type 'push bako'.")
+
+def describe_action(a):
+    """The text of the approval card for a proposed commit and push (markdown)."""
+    st_ = a.get("file_status", {})
+    lines = [f'Bako proposes to commit **{len(a["files"])} file(s)** to the NEW branch `{a["branch"]}` and push it (never main).',
+             f'Commit message: {a["message"]}', ""]
+    lines += [f"- `{f}` · {st_.get(f, 'changed')}" for f in a["files"]]
+    lines += ["", 'Type exactly **push bako** in the chat to do it. Anything else cancels.']
+    return "\n".join(lines)
 
 ## ---------------------------------------------------------------
 ## 4. THE TOOL MENU the model sees
@@ -351,9 +382,10 @@ TOOLS_OLD = [
          {"which": {"type": "string", "enum": ["log", "trace"]}, "lines": {"type": "integer"}}),
     tool("propose_start", "Propose starting the lab. The human must approve in the window."),
     tool("propose_stop", "Propose stopping (destroying) the lab. The human must approve in the window."),
-    tool("propose_commit_push", "Propose committing the listed files to a NEW branch and pushing it. "
-         "Never main. The human must approve in the window.",
-         {"branch": S, "message": S, "files": {"type": "array", "items": S}}, ["branch", "message", "files"]),
+    tool("propose_commit_push", "Propose committing changed files to a NEW branch and pushing it. Never main. "
+         "The branch name is chosen by code. Give a short commit message. files is optional: leave it out to include "
+         "every changed and new file. The human sees the file list and must approve in the window.",
+         {"message": S, "files": {"type": "array", "items": S}}, ["message"]),
 ]
 ## The lean menu: same tools, clearer descriptions (the model chooses from these words, so they matter).
 _LEAN_DESC = {
@@ -429,7 +461,12 @@ More rules:
   If it is unclear, check github runs first, then agent_logs stages. Say which one you looked at.
 - Always say how old a failure is and whether newer runs succeeded. Never call failed_log on a run that did not fail.
 - If a tool returns nothing useful, try at most ONE different tool, then answer with what you know.
-- To review or merge a bot pull request, tell the human to use the "Review and merge here" button in the window. You cannot merge."""
+- You cannot merge anything yourself. How merging works for the human:
+  * File changes: you propose a commit and push (new branch bako/update-..., named by code). After they type "push bako", a card at the top
+    of the Lab page lets them open the pull request, see every file (new, modified, deleted, lines added and removed), and merge it by typing "merge bako".
+  * The bot's image pull request (branch deploy/image-...): the "Review and merge here" button in the START flow, also with "merge bako".
+  Never offer to merge, and never say you will "propose a bot PR" for file changes.
+- If the working tree is clean after a push, the changes are already pushed. Say so, and point to the card for the pull request."""
 
 
 ## ---------------------------------------------------------------
@@ -493,7 +530,7 @@ def run_turn(client, model, history, user_text, repo):
              "question": _cap(user_text, TRACE_MSG_CAP),
              "mode": "lean" if LEAN else "old", "system_chars": len(system), "builtin_rules_chars": len(rules), "notes_chars": len(notes),
              "history_count": len(past), "max_tool_calls": MAX_TOOL_CALLS,
-             "token_budget": TURN_TOKEN_BUDGET if LEAN else None, "stopped_by": None,
+             "cost_budget": TURN_COST_BUDGET if LEAN else None, "spent": 0.0, "stopped_by": None,
              ## where the first call's input goes (estimates: characters / 4). Resent on EVERY call of the message.
              "anatomy": {"rules": len(rules) // 4, "charter_md": len(notes) // 4, "tool_menu": len(json.dumps(tools)) // 4,
                          "earlier_messages": sum(len(m.get("content") or "") for m in past) // 4, "your_question": len(user_text) // 4},
@@ -501,15 +538,16 @@ def run_turn(client, model, history, user_text, repo):
     LAST_TRACE = trace
     ctx = {"action": None}
     tokens = 0
+    prices = usage.get_prices(repo)
     reply = ""
     done = set()                 # (tool, arguments) already called in this turn
     for n in range(MAX_TOOL_CALLS + 1):
-        over_tokens = LEAN and n > 0 and tokens >= TURN_TOKEN_BUDGET
-        last = (n == MAX_TOOL_CALLS) or over_tokens
+        over_cost = LEAN and n > 0 and trace["spent"] >= TURN_COST_BUDGET
+        last = (n == MAX_TOOL_CALLS) or over_cost
         if last:                 # budget used: force a plain answer from what we already know
-            trace["stopped_by"] = "token_budget" if over_tokens else "tool_limit"
+            trace["stopped_by"] = "cost_budget" if over_cost else "tool_limit"
             msgs.append({"role": "system", "content":
-                         ("Token budget used. " if over_tokens else "Tool budget used. ") +
+                         ("Cost budget used. " if over_cost else "Tool budget used. ") +
                          "Answer now from the tool results above. "
                          "Say plainly what you could not find out. No more tools."})
         params = {"model": model, "tool_choice": "none" if last else "auto", "parallel_tool_calls": False}
@@ -536,6 +574,8 @@ def run_turn(client, model, history, user_text, repo):
                         "cached_tokens": getattr(getattr(u, "prompt_tokens_details", None), "cached_tokens", 0) or 0,
                         "reasoning_tokens": getattr(getattr(u, "completion_tokens_details", None), "reasoning_tokens", 0) or 0}
         tokens += rnd["usage"]["total_tokens"]
+        trace["spent"] = round(trace["spent"] + usage.turn_cost(rnd["usage"]["prompt_tokens"], rnd["usage"]["cached_tokens"],
+                                                                rnd["usage"]["completion_tokens"], prices), 6)
         m = resp.choices[0].message
         rnd["response"] = {"finish_reason": getattr(resp.choices[0], "finish_reason", None),
                            "content": _cap(m.content, TRACE_MSG_CAP) if m.content else None,

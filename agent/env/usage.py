@@ -308,8 +308,10 @@ def judge(row, ref):
         expected, basis = fixed, "the fixed part only (not enough history yet: needs 5 messages with the same number of tool calls)"
     ratio = (row["total"] / expected) if expected else 0
     high, very = (2.0, 3.0) if k in ref["typical"] else (1.5, 3.0)
-    flag = "very high" if (row["stopped_by"] == "token_budget" or ratio >= very) else "high" if ratio >= high else "normal"
-    return {"expected": int(expected), "ratio": ratio, "flag": flag, "fixed": min(fixed, row["total"]),
+    flag = "very high" if ratio >= very else "high" if ratio >= high else "normal"
+    cut = {"cost_budget": "cut by the cost budget", "token_budget": "cut by the token budget",
+           "tool_limit": "cut by the 6-call limit"}.get(row["stopped_by"], "")
+    return {"expected": int(expected), "ratio": ratio, "flag": flag, "cut": cut, "fixed": min(fixed, row["total"]),
             "variable": max(0, row["total"] - fixed), "basis": basis}
 
 def chat_cost_by_day(repo, prices=None):

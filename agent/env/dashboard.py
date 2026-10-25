@@ -106,7 +106,7 @@ section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] h3 { color:
 .st-key-chat, .st-key-checks { background: @card@; border-radius: 24px; padding: 20px 22px; }
 .st-key-today { background: @panel@; border-radius: 24px; padding: 20px 22px; }
 .st-key-today, .st-key-today div, .st-key-today span, .st-key-today p { color: @onPanel@; }
-.st-key-approve { background: @notice@; border: 2px solid @ink@; border-radius: 22px; padding: 18px 22px; margin-top: 14px; }
+.st-key-approve, .st-key-codepr { background: @notice@; border: 2px solid @ink@; border-radius: 22px; padding: 18px 22px; margin-top: 14px; }
 .st-key-runbox { background: @card@; border-radius: 22px; padding: 14px 16px; margin-top: 14px; }
 .st-key-runbox pre, .st-key-runbox code { font-size: 12px !important; white-space: pre-wrap !important; word-break: break-word; }
 .stApp pre, .stApp code, [data-testid="stCode"], [data-testid="stCode"] pre { background: @inset@ !important; color: @ink@ !important; }
@@ -177,7 +177,7 @@ st.markdown("<style>" + CSS + "</style>", unsafe_allow_html=True)
 ss = st.session_state
 for key, default in (("chat", []), ("log", []), ("proc", None), ("q", None), ("awaiting", None),
                      ("logfile", None), ("hist", []), ("pending", None), ("tokens", 0), ("refresh", 0),
-                     ("lastmode", None), ("snap", None), ("job", None), ("need_refresh", False)):
+                     ("lastmode", None), ("snap", None), ("job", None), ("need_refresh", False), ("code_pr", None), ("code_pr_loaded", False)):
     ss.setdefault(key, default)
 
 def say(text):
@@ -420,14 +420,15 @@ def questions_section():
             fixed_pct = f"{round(100 * j['fixed'] / r['total'])}%" if r["total"] else "-"
             body += (f"<tr><td>{html.escape(when)}</td><td>{html.escape(r['question'][:70])}</td><td>{html.escape(tools)}</td>"
                      f"<td class='n'>{r['total']:,}</td><td class='n'>{cents(r['cost'])}</td><td class='n'>{fixed_pct}</td>"
-                     f"<td class='n' style='color:{color};font-weight:{weight}'>{j['ratio']:.1f}x · {j['flag']}</td></tr>")
+                     f"<td class='n' style='color:{color};font-weight:{weight}'>{j['ratio']:.1f}x · {j['flag']}"
+                     + (f"<br><span style='font-weight:400;font-size:12px'>{j['cut']}</span>" if j.get('cut') else "") + "</td></tr>")
         st.markdown(f"<div class='card'><table class='rtable'>{head}{body}</table></div>", unsafe_allow_html=True)
         typ = ", ".join(f"{'2+' if k == 2 else k} tool call(s): {v:,} tokens" for k, v in sorted(ref["typical"].items())) or "not enough messages yet (needs 5 with the same number of tool calls)"
         st.caption(f"How to read this. Every message pays a fixed part again on each model call: about {ref['floor']:,} tokens "
                    f"(the rules, the tool menu and your question; measured from your own messages). A message with 2 tool calls makes 3 model calls, "
                    f"so it pays that part 3 times. 'Fixed part' is the share of the message that was only this overhead; the rest is tool results, "
                    f"earlier messages and the answer. Normal = your own median for the same number of tool calls ({typ}). "
-                   f"High = 2x that or more (1.5x of the fixed part while there is little history). Very high = 3x or more, or the message hit the token budget. "
+                   f"High = 2x that or more (1.5x of the fixed part while there is little history). Very high = 3x or more. A message can also be cut by a budget (a cost cap per message, or the 6-call limit); that is shown under the verdict. "
                    f"A very high message with a low fixed part means a big tool result: look at its Telemetry in the Flow tab.")
     with st.expander("Prices used for these dollars"):
         with st.form("price_form", clear_on_submit=False):
@@ -578,6 +579,104 @@ def finish_run_if_done():
     ss.proc, ss.log, ss.awaiting, ss.logfile = None, [], None, None
     ss.need_refresh = True                    # the lab changed: read it again
     return True
+
+## ---------------------------------------------------------------
+## 5b. THE CODE PULL REQUEST CARD
+## After "push bako" the branch is on GitHub. This card opens the pull request, shows EVERY file
+## (new / modified / deleted, lines added and removed, heads-up for CI, Kubernetes, Terraform),
+## and merges only after you type "merge bako". Rules are in prmerge.py (only bako/update-... branches).
+## The card survives a restart of the window (agent/env/reports/code-pr.json).
+## ---------------------------------------------------------------
+CODE_PR_FILE = os.path.join(REPO, "agent", "env", "reports", "code-pr.json")
+
+def code_pr_save():
+    try:
+        if ss.code_pr:
+            os.makedirs(os.path.dirname(CODE_PR_FILE), exist_ok=True)
+            with open(CODE_PR_FILE, "w", encoding="utf-8") as f:
+                json.dump({k: ss.code_pr.get(k) for k in ("branch", "message", "files", "n", "url")}, f)
+        elif os.path.exists(CODE_PR_FILE):
+            os.remove(CODE_PR_FILE)
+    except OSError:
+        pass
+
+if not ss.code_pr_loaded:
+    ss.code_pr_loaded = True
+    try:
+        with open(CODE_PR_FILE, encoding="utf-8") as f:
+            ss.code_pr = json.load(f)
+    except (OSError, ValueError):
+        pass
+
+def code_pr_card():
+    cp = ss.code_pr
+    with st.container(key="codepr"):
+        st.markdown(f"**Your push is on GitHub: branch `{html.escape(cp['branch'])}`.** Next: open a pull request, review every file, "
+                    "then merge it into main.")
+        if not GHCLI:
+            st.error("The gh program was not found on this computer, so this cannot be done from here. Open the branch on GitHub instead.")
+            return
+        if not cp.get("n"):
+            c1, c2 = st.columns(2)
+            if c1.button("Open the pull request", key="codepr_open", use_container_width=True):
+                ok, n, text = prmerge.open_pr(GHCLI, cp["branch"], cp.get("message", ""), REPO)
+                if ok:
+                    cp["n"], cp["url"] = n, text
+                    cp["review"] = prmerge.review(GHCLI, n, REPO)
+                    code_pr_save()
+                else:
+                    cp["err"] = text
+                st.rerun()
+            if c2.button("Not now", key="codepr_dismiss", use_container_width=True):
+                ss.code_pr = None; code_pr_save(); st.rerun()
+            if cp.get("err"):
+                st.error(cp["err"])
+            return
+        n = cp["n"]
+        top1, top2, top3 = st.columns([1.7, 1.3, 1.3])
+        top1.markdown(f"**Pull request #{n}** into main")
+        if top2.button("Check again", key="codepr_refresh", use_container_width=True, help="Reads the pull request and its CI checks again."):
+            cp["review"] = prmerge.review(GHCLI, n, REPO); st.rerun()
+        if top3.button("On GitHub", key="codepr_web", use_container_width=True, help="Opens the pull request in your browser.") and cp.get("url"):
+            webbrowser.open(cp["url"])
+        rv = cp.get("review") or prmerge.review(GHCLI, n, REPO)
+        cp["review"] = rv
+        if rv.get("problems"):
+            st.error("Cannot merge from here: " + " ".join(rv["problems"]))
+        if rv.get("files") is not None and not (rv.get("problems") and not rv.get("files")):
+            ck = rv.get("checks", {})
+            st.markdown(f"**{html.escape(str(rv.get('title', '')))}**  \n"
+                        f"{len(rv.get('files', []))} files · +{rv.get('additions', 0)} lines / -{rv.get('deletions', 0)} lines · "
+                        f"CI checks: {ck.get('passed', 0)} passed, {ck.get('running', 0)} running, {ck.get('failed', 0)} failed")
+            head = ("<tr><th>File</th><th>Change</th><th class='n'>Added</th><th class='n'>Removed</th><th>Heads-up</th></tr>")
+            body = "".join(f"<tr><td>{html.escape(f['path'])}</td><td>{html.escape(f['status'])}</td>"
+                           f"<td class='n'>+{f['additions']}</td><td class='n'>-{f['deletions']}</td>"
+                           f"<td>{html.escape(f.get('note', ''))}</td></tr>" for f in rv.get("files", []))
+            st.markdown(f"<table class='rtable'>{head}{body}</table>", unsafe_allow_html=True)
+            for w in rv.get("warnings", []):
+                if ": " not in w:                       # file notes are already in the table
+                    st.warning(w)
+            with st.expander("Show the full diff"):
+                st.code(rv.get("diff", ""), language="diff")
+        if not rv.get("problems"):
+            st.markdown("Type exactly `merge bako` to merge it into main. Anything else means no. Bako compares the word itself.")
+            with st.form("codepr_merge_form", clear_on_submit=True):
+                word = st.text_input("Your answer", label_visibility="collapsed", placeholder="merge bako")
+                c1, c2 = st.columns(2)
+                yes = c1.form_submit_button("Merge", use_container_width=True)
+                no = c2.form_submit_button("Cancel", use_container_width=True)
+            if yes:
+                if word.strip() == "merge bako":
+                    ok, text = prmerge.merge(GHCLI, n, REPO)
+                    say(text)
+                    if ok:
+                        ss.code_pr = None; code_pr_save()
+                else:
+                    say("Not merged. You must type exactly: merge bako")
+                st.rerun()
+            if no:
+                say("Cancelled. Nothing was merged. The pull request is still open on GitHub.")
+                ss.code_pr = None; code_pr_save(); st.rerun()
 
 def live_panel():
     if ss.proc is not None:
@@ -751,9 +850,9 @@ with main:
     ## --- a proposed commit + push waits for "push bako" ---
     if ss.pending:
         a = ss.pending
-        st.warning(f'Bako proposes to commit to the NEW branch "{a["branch"]}" and push it. '
-                   f'Message: {a["message"]}. Files: ' + ", ".join(a["files"]) +
-                   '. Type exactly "push bako" in the chat to do it. Anything else cancels.')
+        st.warning(bako_chat.describe_action(a))
+    if ss.code_pr:
+        code_pr_card()
 
     ## --- tabs ---
     t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs(["Lab", "Flow", "Infra and cost", "Cluster", "Repo"])
@@ -842,7 +941,12 @@ with side:
             if ss.pending:
                 action, ss.pending = ss.pending, None
                 if prompt.strip() == "push bako":
-                    say("```\n" + bako_chat.do_commit_push(REPO, action) + "\n```")
+                    result = bako_chat.do_commit_push(REPO, action)
+                    say("```\n" + result + "\n```")
+                    if "\nDONE." in result:
+                        ss.code_pr = {"branch": action["branch"], "message": action["message"], "files": action["files"], "n": None}
+                        code_pr_save()
+                        say("Pushed. A card at the top of the Lab page lets you open the pull request, review every file and merge it.")
                 else:
                     say("Cancelled. Nothing was committed or pushed.")
             elif running and ss.awaiting:
