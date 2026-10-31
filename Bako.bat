@@ -7,4 +7,6 @@ if not exist "agent\.venv\Scripts\python.exe" (
   pause
   exit /b 1
 )
+rem Close any Bako still running in the background, so new files are always the ones that load.
+call "%~dp0Stop-Bako.bat"
 start "Bako" /min "agent\.venv\Scripts\python.exe" "agent\env\bako_app.py"

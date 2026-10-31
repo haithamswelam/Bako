@@ -18,10 +18,11 @@ import shellenv
 import prmerge
 import usage
 import flow_tab
+import tabs
 import importlib
 ## Streamlit keeps imported files in memory until the server restarts. Reloading the small helper files
 ## on every full page run means a copied-in new version is used straight away.
-for _m in (redact, shellenv, prmerge, usage, flow_tab):
+for _m in (redact, shellenv, prmerge, usage, flow_tab, tabs):
     importlib.reload(_m)
 
 ## ---------------------------------------------------------------
@@ -101,9 +102,13 @@ html, body, [class*="css"], .stApp, button, input, textarea { font-family: 'Outf
 header[data-testid="stHeader"] { background: transparent; }
 .block-container { padding-top: 1.6rem; max-width: 1560px; }
 section[data-testid="stSidebar"] { background: @card@; }
+/* The sidebar always stays open: hide its collapse arrow, and if it was collapsed earlier, show it again. */
+[data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="stExpandSidebarButton"] { display: none !important; }
+section[data-testid="stSidebar"][aria-expanded="false"] { transform: none !important; margin-left: 0 !important; min-width: 300px !important; width: 300px !important; visibility: visible !important; }
 section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] h3 { color: @ink@; }
 .st-key-hdr { background: linear-gradient(135deg, @soft@ 0%, @light@ 70%); border-radius: 28px; padding: 26px 30px; }
-.st-key-chat, .st-key-checks { background: @card@; border-radius: 24px; padding: 20px 22px; }
+.st-key-chat, .st-key-checks, .st-key-detail { background: @card@; border-radius: 24px; padding: 20px 22px; }
+.st-key-detail { margin-top: 14px; }
 .st-key-today { background: @panel@; border-radius: 24px; padding: 20px 22px; }
 .st-key-today, .st-key-today div, .st-key-today span, .st-key-today p { color: @onPanel@; }
 .st-key-approve, .st-key-codepr { background: @notice@; border: 2px solid @ink@; border-radius: 22px; padding: 18px 22px; margin-top: 14px; }
@@ -851,11 +856,16 @@ with main:
     if ss.pending:
         a = ss.pending
         st.warning(bako_chat.describe_action(a))
+        stamp = a["branch"].rsplit("-", 2)[-2] + "-" + a["branch"].rsplit("-", 1)[-1]
+        label = st.text_input("Branch name (optional): a few words, for example prmerge-fix. Bako adds the bako/update- start and the time.",
+                              key="branch_label_" + stamp, placeholder="leave empty for the automatic name")
+        a["branch"] = bako_chat.branch_for(label, stamp)
+        st.caption(f"The branch will be: {a['branch']}")
     if ss.code_pr:
         code_pr_card()
 
     ## --- tabs ---
-    t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs(["Lab", "Flow", "Infra and cost", "Cluster", "Repo"])
+    t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs(["Lab", "Flow", "AWS", "Cluster", "Repo"])
 
     with t_lab:
         pods = None if running or not snap else snap["pods"]
@@ -913,16 +923,11 @@ with main:
                       on_rerun=rerun_from)
 
     with t_infra:
-        st.markdown("<div class='card'><div class='ctitle'>Infra and cost</div>Coming in phase 2: counts of what is "
-                    "running in AWS, the estimate since START, and the real month-to-date cost on a button.</div>",
-                    unsafe_allow_html=True)
+        tabs.aws_tab(dict(repo=REPO, env=UENV, bash=BASH, T=T, hourly=HOURLY, up_now=up_now))
     with t_cluster:
-        st.markdown("<div class='card'><div class='ctitle'>Cluster</div>Coming in phase 2: pods, the Argo CD app "
-                    "and the image tags running in the cluster.</div>", unsafe_allow_html=True)
+        tabs.cluster_tab(dict(repo=REPO, env=UENV, kubectl=KUBECTL, state=state, T=T))
     with t_repo:
-        st.markdown("<div class='card'><div class='ctitle'>Repo</div>Coming in phase 3: branch, changes, pull requests "
-                    "and CI runs, with commit and merge buttons. For now, ask Bako in the chat.</div>",
-                    unsafe_allow_html=True)
+        tabs.repo_tab(dict(repo=REPO, env=UENV, gh=GHCLI, T=T))
 
 with side:
     with st.container(key="chat"):
@@ -938,6 +943,9 @@ with side:
         prompt = ss.pop("flow_prompt", None) or prompt          # a "troubleshoot this step" click from the Flow tab
         if prompt:
             ss.chat.append(("user", prompt))
+            with box:                                            # show the question at once, before the answer is ready
+                with st.chat_message("user"):
+                    st.markdown(prompt)
             if ss.pending:
                 action, ss.pending = ss.pending, None
                 if prompt.strip() == "push bako":
@@ -955,9 +963,13 @@ with side:
             elif running:
                 say("I am in the middle of a run. Please wait until it finishes.")
             else:
-                handle(prompt)
+                with box:                                        # the "thinking" spinner appears under the question
+                    handle(prompt)
             st.rerun()
 
     ## --- live area: approval box and run output, under the chat (refreshes by itself) ---
     busy = ss.proc is not None or ss.job is not None
     st.fragment(live_panel, run_every=1 if busy else None)()
+
+    ## --- details of the row you clicked on the Repo or Cluster tab ---
+    tabs.detail_panel(dict(repo=REPO, env=UENV, gh=GHCLI, kubectl=KUBECTL))

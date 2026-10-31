@@ -248,28 +248,84 @@ def t_github(repo, ctx, kind, run_id=""):
 
 NOISE = re.compile(r"(Still (creating|destroying|modifying)\.\.\.|Refreshing state\.\.\.)")
 
+def _hms(secs):
+    secs = int(secs)
+    return f"{secs // 60} min {secs % 60:02d} s" if secs >= 60 else f"{secs} s"
+
+def _secs(t):
+    try:
+        x = datetime.datetime.strptime(str(t), "%H:%M:%S")
+        return x.hour * 3600 + x.minute * 60 + x.second
+    except ValueError:
+        return None
+
+def _timeline(events):
+    """CODE does the clock arithmetic (the model gets it wrong). Milestones in order, with the time since the one before.
+    Milestones: the start, the first 'done' of each stage, your approval, and the end of terraform apply (the stage events
+    for approval and apply are written at the same second, so they cannot show how long apply really took)."""
+    marks, seen = [], set()
+    for e in events:
+        t, ev = _secs(e.get("time")), e.get("event")
+        if t is None:
+            continue
+        if ev == "run_start":
+            marks.append((t, "start"))
+        elif ev == "approval" and e.get("approved"):
+            marks.append((t, "you approved " + str(e.get("tool", ""))))
+        elif ev == "step_result" and str(e.get("step", "")).startswith("terraform_"):
+            marks.append((t, str(e["step"]) + " finished"))
+        elif ev == "stage" and e.get("status") == "done" and e.get("id") not in seen:
+            seen.add(e.get("id"))
+            marks.append((t, f"{e.get('id')} done"))
+    out, prev = [], None
+    for t, label in marks:
+        if prev is not None and t < prev[0]:
+            t += 86400                                      # the run crossed midnight
+        if prev is not None and t == prev[0]:
+            continue                                        # same second as the milestone before: nothing to add
+        out.append((label, t, 0 if prev is None else t - prev[0]))
+        prev = (t, label)
+    return out
+
 def _stages_summary(folder):
     files = [f for f in os.listdir(folder) if f.startswith("trace-") and f.endswith(".jsonl")]
     if not files:
         return "no trace files yet"
     newest = max(files, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
     path = os.path.join(folder, newest)
-    mode, started, stages = "?", "?", {}
+    mode, started, stages, events = "?", "?", {}, []
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
+            events.append(e)
             if e.get("event") == "run_start":
                 mode, started = e.get("mode", "?"), e.get("time", "?")
             elif e.get("event") == "stage":
                 stages[e.get("id")] = (e.get("status", "?"), str(e.get("detail", ""))[:140].replace("\n", " "))
     age = ago(datetime.datetime.utcfromtimestamp(os.path.getmtime(path)))
-    head = f"[{newest}] {mode.upper()} run, started {started}, last written {age}"
+    tl = _timeline(events)
+    head = f"[{newest}] {mode.upper()} run, started {started}"
+    if len(tl) >= 2:
+        total = tl[-1][1] - tl[0][1]
+        slow = max(tl[1:], key=lambda m: m[2])
+        head += (f", last event at {_hms_clock(tl[-1][1])}, total {_hms(total)}. Slowest part: {slow[0]} after {_hms(slow[2])}"
+                 f" (file last written {age})")
+    else:
+        head += f" (file last written {age}; no event times in it)"
     if not stages:
         return head + "\nno stage events in this trace (older run style or a STOP run)"
-    return clip(head + "\n" + "\n".join(f"{k}: {v[0]}" + (f" - {v[1]}" if v[1] else "") for k, v in stages.items()))
+    body = "\n".join(f"{k}: {v[0]}" + (f" - {v[1]}" if v[1] else "") for k, v in stages.items())
+    if len(tl) >= 2:
+        body += "\nTimeline (time since the milestone before):\n" + "\n".join(
+            f"{_hms_clock(t)} {label}" + ("" if i == 0 else f" (+{_hms(d)})") for i, (label, t, d) in enumerate(tl))
+    return clip(head + "\n" + body)
+
+def _hms_clock(secs):
+    secs = int(secs) % 86400
+    return f"{secs // 3600:02d}:{secs % 3600 // 60:02d}:{secs % 60:02d}"
 
 def t_agent_logs(repo, ctx, which="log", lines=None):
     folder = os.path.join(repo, "agent", "env", "reports")
@@ -281,6 +337,8 @@ def t_agent_logs(repo, ctx, which="log", lines=None):
     if which not in pats:
         return "ERROR: which must be " + ("stages, log or trace" if LEAN else "log or trace")
     files = [f for f in os.listdir(folder) if f.endswith(pats[which])]
+    if LEAN and which == "trace":                 # only the lab agent's own traces, never Bako's chat records (chat-traces.jsonl)
+        files = [f for f in files if f.startswith("trace-")]
     if not files:
         return "no such files yet"
     newest = max(files, key=lambda f: os.path.getmtime(os.path.join(folder, f)))
@@ -321,6 +379,13 @@ def _changed_files(repo):
         res[path] = ("new" if xy == "??" or "A" in xy else "deleted" if "D" in xy else "renamed" if "R" in xy else "modified")
     return res
 
+def branch_for(label, stamp=None):
+    """bako/update-[<label>-]<date>-<time>. The label is cleaned by code: letters, digits and dashes only, 30 characters.
+    The bako/update- start is fixed, because the merge button only accepts branches that start with it."""
+    stamp = stamp or datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    slug = re.sub(r"[^a-z0-9]+", "-", str(label or "").lower()).strip("-")[:30].strip("-")
+    return "bako/update-" + (slug + "-" if slug else "") + stamp
+
 def t_propose_commit_push(repo, ctx, message="", files=None, branch=None):
     ## The BRANCH NAME and the FILE LIST come from code, not from the model:
     ##   - the branch is bako/update-<date>-<time> (a model-chosen name is ignored)
@@ -339,7 +404,7 @@ def t_propose_commit_push(repo, ctx, message="", files=None, branch=None):
     skipped = [f for f in wanted if f not in changed]
     if not names:
         return "ERROR: none of the files you listed has changes. Changed files: " + ", ".join(list(changed)[:30])
-    branch = "bako/update-" + datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    branch = branch_for("")
     ctx["action"] = {"type": "commit_push", "branch": branch, "message": (message or "").strip() or "Update Bako files",
                      "files": names, "file_status": {f: changed[f] for f in names}}
     note = f" ({len(skipped)} listed file(s) had no changes and were left out)" if skipped else ""
