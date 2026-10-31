@@ -1,0 +1,38 @@
+# The public door: one ALB in the public subnets, sending everything to the frontend.
+# The frontend's nginx already forwards /api to the backend, so one rule is enough.
+# The AWS Load Balancer Controller (installed by bootstrap-cluster.sh) reads this object and builds the ALB.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bako
+  namespace: bako
+  annotations:
+    # internet-facing = reachable from your phone without a VPN
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # ip = the ALB talks straight to the pod addresses (VPC CNI gives pods real VPC IPs)
+    alb.ingress.kubernetes.io/target-type: ip
+    # Step 1 is plain HTTP, so TEST DATA ONLY. Step 2 adds 443 + a certificate and redirects 80 to 443.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    # Who may connect. 0.0.0.0/0 = everyone. To allow only yourself, put your own address here, for example 203.0.113.7/32
+    alb.ingress.kubernetes.io/inbound-cidrs: 0.0.0.0/0
+    # The ALB marks a pod healthy when this path answers 200 (the frontend serves its homepage at /)
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # Pods that are being replaced stop receiving traffic after 30 s instead of the default 300 s
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    # Tags on the AWS resources, to find them in the console and in the bill
+    alb.ingress.kubernetes.io/tags: Project=bako,Environment=lab
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: bako-frontend-service
+                port:
+                  number: 80

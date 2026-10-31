@@ -227,6 +227,23 @@ def tool_terraform_plan_destroy():
     return summary
 
 ## ---------------------------------------------------------------
+## release_load_balancer  (our code, runs inside the destroy tool, AFTER you typed "destroy bako")
+## The ALB is not in terraform: the AWS Load Balancer Controller builds it from K8s/ingress.yaml. If the cluster is
+## destroyed first, nobody is left to delete it: it keeps billing every hour and blocks the VPC from being deleted.
+## agent/env/pre-destroy-alb.sh removes the Ingress (so the controller removes the ALB), then waits until AWS shows
+## no load balancer or controller security group for this cluster. Exit 0 is the ONLY result that lets the destroy go on.
+## It is fail-closed: a missing script, a timeout or an AWS error all mean "do not destroy".
+## ---------------------------------------------------------------
+RELEASE_SCRIPT = "agent/env/pre-destroy-alb.sh"
+
+def release_load_balancer():
+    if not os.path.exists(RELEASE_SCRIPT):
+        return False, f"{RELEASE_SCRIPT} is missing. Copy it next to agent.py. The destroy is refused without it."
+    code, out = run_cmd([BASH, RELEASE_SCRIPT], timeout=12 * 60, env=UNIX_ENV)
+    out = redact.redact(out)
+    return code == 0, f"pre-destroy-alb.sh exit {code}\n{out[-1500:]}"
+
+## ---------------------------------------------------------------
 ## TOOL 5: terraform_destroy  (our code, DELETES everything, needs typed approval)
 ## a) refuses unless the account check passed AND a clean destroy plan exists
 ## b) shows the plan and waits for the human to type: destroy bako
@@ -245,6 +262,15 @@ def tool_terraform_destroy():
     if answer != "destroy bako":
         STATE["stop_now"] = "human did not approve"
         return "REFUSED: the human did not approve. Do nothing more."
+    ## Step before the destroy: take the load balancer away while the cluster still exists. Refuse if it is still there.
+    print("Releasing the load balancer first (pre-destroy-alb.sh)...")
+    released, note = release_load_balancer()
+    trace(event="step_result", step="release_load_balancer", result=note[-1500:])
+    if not released:
+        STATE["stop_now"] = "load balancer still exists"
+        return ("REFUSED: the load balancer is not released, so destroying the cluster now would leave it running and billing. "
+                "Nothing was destroyed.\n" + note)
+    print("Load balancer released.")
     log_path = f"agent/env/reports/destroy-{time.strftime('%Y%m%d-%H%M%S')}.log"
     print(f"Destroy started. It takes about 10-15 minutes. Watch it with: tail -f {log_path}")
     try:
