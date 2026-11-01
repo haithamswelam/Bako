@@ -40,6 +40,11 @@ def build_ai_chat_actions(
 
     actions = []
     seen_goal_ids = set()
+    forecasts = {
+        int(goal["id"]): goal
+        for goal in insight_data.get("goal_forecasts", [])
+        if goal.get("id") is not None
+    }
     for insight in insight_data.get("structured_insights", []):
         goal_id = insight.get("goal_id")
         amount = round(float(insight.get("amount") or 0), 2)
@@ -51,6 +56,13 @@ def build_ai_chat_actions(
             continue
 
         goal_id = int(goal_id)
+        forecast = forecasts.get(goal_id, {})
+        daily_saving = forecast.get("required_daily_saving")
+        # Prefer the daily target over a larger carryover allocation.
+        if daily_saving is not None and float(daily_saving) > 0:
+            amount = round(min(amount, float(daily_saving)), 2)
+        if amount <= 0:
+            continue
         if named_goal_ids and goal_id not in named_goal_ids:
             continue
         if goal_id in seen_goal_ids:

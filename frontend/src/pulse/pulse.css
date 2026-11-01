@@ -5814,6 +5814,10 @@ html[dir="rtl"] .pulse-toast {
   border-radius: var(--pulse-radius-sm) !important;
   color: var(--pulse-black) !important;
   background: var(--pulse-green) !important;
+}
+
+.pulse-modal .goal-modal-content .goal-form .primary-button,
+.pulse-modal .goal-modal-content .goal-form .pulse-button-secondary {
   font-family: var(--pulse-font);
   font-size: 8px;
   font-weight: 600;

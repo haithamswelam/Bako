@@ -48,6 +48,21 @@ const baseProps = {
 }
 
 describe('ModernDashboard', () => {
+  it('updates the home balance and percentage from today after spending', () => {
+    const now = new Date()
+    const date = [now.getFullYear(), String(now.getMonth() + 1).padStart(2, '0'), String(now.getDate()).padStart(2, '0')].join('-')
+    const day = { date, status: 'actual', available_today: 1554.5, remaining_today: 1554.5, used_today: 0 }
+    const { container, rerender } = render(<ModernDashboard {...baseProps} dailyTable={[day]} />)
+    expect(container.querySelector('.editorial-safe-value')).toHaveTextContent('1,554.50')
+    expect(screen.getByText('100% left today')).toBeInTheDocument()
+    rerender(<ModernDashboard {...baseProps} dailyTable={[{ ...day, used_today: 214.99, remaining_today: 1339.51 }]} />)
+    expect(container.querySelector('.editorial-safe-value')).toHaveTextContent('1,339.51')
+    expect(screen.getByText('86% left today')).toBeInTheDocument()
+    rerender(<ModernDashboard {...baseProps} dailyTable={[{ ...day, used_today: 1600, remaining_today: -45.5 }]} />)
+    expect(screen.getByText('0% left today')).toBeInTheDocument()
+    expect(screen.queryByText('On track')).not.toBeInTheDocument()
+  })
+
   it('keeps currency separate and opens one financial card inline', () => {
     render(<ModernDashboard {...baseProps} />)
 
