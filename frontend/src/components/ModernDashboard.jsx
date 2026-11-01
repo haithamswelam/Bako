@@ -157,7 +157,20 @@ function ModernDashboard({
   const railDate = formatRailCalendarDate(currentCalendarDate, language);
   const railWeekday = formatRailWeekday(currentCalendarDate, language);
   const railCalendarLabel = formatRailCalendarLabel(currentCalendarDate, language);
-  const safeDailyAllowance = Number(budgetData?.current_daily_allowance || 0);
+  const todayKey = [
+    currentCalendarDate.getFullYear(),
+    String(currentCalendarDate.getMonth() + 1).padStart(2, "0"),
+    String(currentCalendarDate.getDate()).padStart(2, "0"),
+  ].join("-");
+  const today = dailyTable.find((day) => day.date === todayKey);
+  const dailyAllowance = Number(today?.available_today ?? budgetData?.current_daily_allowance ?? 0);
+  const safeDailyAllowance = Number(today?.remaining_today ?? dailyAllowance);
+  const dailyPercentageLeft = dailyAllowance > 0
+    ? Math.min(100, Math.max(0, (safeDailyAllowance / dailyAllowance) * 100))
+    : 0;
+  const percentageLabel = new Intl.NumberFormat(isArabic ? "ar-EG" : "en-US", {
+    style: "percent", maximumFractionDigits: 0,
+  }).format(dailyPercentageLeft / 100);
   const remainingBudget = Number(budgetData?.remaining_total_budget || 0);
   const isBudgetDepleted = remainingBudget <= 0;
   const isDailyLimitReached = safeDailyAllowance <= 0;
@@ -350,9 +363,11 @@ function ModernDashboard({
           <span className="editorial-kicker">{t.safe}</span>
           <PulseFinancialValue
             className="editorial-safe-value editorial-private-value"
-            amount={money(safeDailyAllowance, language)}
+            amount={new Intl.NumberFormat(isArabic ? "ar-EG" : "en-US", {
+              minimumFractionDigits: 2, maximumFractionDigits: 2,
+            }).format(safeDailyAllowance)}
           />
-          <div className={`editorial-safe-status ${needsBudgetWarning ? "is-alert" : ""}`}><span>— {budgetData?.remaining_days || 0} {t.daysLeft}</span><i /><span>{budgetStatus}</span></div>
+          <div className={`editorial-safe-status ${needsBudgetWarning ? "is-alert" : ""}`}><span>— {budgetData?.remaining_days || 0} {t.daysLeft}</span><i /><span>{budgetStatus}</span>{today && <span className="editorial-private-value">{percentageLabel} {isArabic ? "متبقي اليوم" : "left today"}</span>}</div>
         </section>
         </div>
 

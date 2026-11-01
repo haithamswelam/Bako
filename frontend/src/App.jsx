@@ -46,6 +46,7 @@ import {
   createExpense,
   createGoal,
   updateGoal,
+  deleteGoal,
   contributeToGoal,
   registerUser,
   loginUser,
@@ -1654,6 +1655,31 @@ function App() {
     } catch (error) {
       console.error(error);
       showToast(error.message || "Failed to save goal", "error");
+    } finally {
+      setGoalLoading(false);
+    }
+  };
+
+  const handleDeleteGoal = async () => {
+    if (!editingGoal || goalLoading) return;
+    const goal = editingGoal;
+    const confirmed = await requestConfirmation({
+      title: "Delete this goal?",
+      message: `Deleting "${goal.name}" permanently removes the goal and its recorded contributions. Budget balances will be recalculated. This cannot be undone.`,
+      confirmLabel: "Delete goal"
+    });
+    if (!confirmed) return;
+
+    try {
+      setGoalLoading(true);
+      await deleteGoal(goal.id);
+      setIsGoalModalOpen(false);
+      resetGoalForm();
+      if (currentCycleId) await refreshDashboardAndSelectedDay(currentCycleId);
+      else await refreshDashboard(currentCycleId);
+      showToast("Goal deleted");
+    } catch (error) {
+      showToast(error.message || "Failed to delete goal", "error");
     } finally {
       setGoalLoading(false);
     }
@@ -3280,7 +3306,7 @@ showToast("Expense deleted");
                   </button>
                 ))}
                 <small>
-                  Amount calculated by Bako rules. Money moves only when
+                  Amount checked by Bako. A contribution is recorded only when
                   you press the button.
                 </small>
               </div>
@@ -3887,6 +3913,7 @@ showToast("Expense deleted");
       <Modal
         isOpen={isGoalModalOpen}
         onClose={() => {
+          if (goalLoading || confirmationRequest) return;
           setIsGoalModalOpen(false);
           resetGoalForm();
         }}
@@ -3907,6 +3934,7 @@ showToast("Expense deleted");
             values={goalForm}
             onChange={handleGoalFieldChange}
             onSubmit={handleGoalSubmit}
+            onDelete={editingGoal ? handleDeleteGoal : undefined}
             loading={goalLoading}
             submitLabel={editingGoal ? "Update Goal" : "Create Goal"}
           />

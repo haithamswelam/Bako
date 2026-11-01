@@ -16,6 +16,7 @@ from app.services.ai_explanation_orchestrator import (
     unknown_goal_outcome,
 )
 from app.services.ai_chat_action_service import build_ai_chat_actions
+from app.services.ai_goal_followup_service import build_goal_adjustment
 from app.services.ai_chat_history_service import (
     get_ai_chat_history,
     get_ai_usage_summary,
@@ -169,10 +170,16 @@ def get_shadow_cycle_coach_explanation(
             history_days=payload.history_days,
             user_id=current_user["id"],
         )
+        goal_adjustment = build_goal_adjustment(
+            payload.question,
+            user_id=current_user["id"],
+            cycle_id=payload.cycle_id,
+            remaining_budget=cycle_coach["financial_position"]["remaining_budget"],
+        )
         explanation_request, question_plan = (
             build_contextual_explanation_request(
                 cycle_coach=cycle_coach,
-                question=payload.question,
+                question="Tell me about goals" if goal_adjustment else payload.question,
                 user_id=current_user["id"],
             )
         )       
@@ -190,7 +197,9 @@ def get_shadow_cycle_coach_explanation(
         )
         
 
-        if "conversation" in question_plan.topics:
+        if goal_adjustment:
+            outcome = goal_adjustment[0]
+        elif "conversation" in question_plan.topics:
             display_name = (current_user.get("display_name") or "").strip()
             first_name = (
                 display_name.split()[0][:40]
@@ -259,7 +268,7 @@ def get_shadow_cycle_coach_explanation(
                 "bako.ai.fallback_reason",
                 outcome.metadata.fallback_reason,
             )
-        suggested_actions = (
+        suggested_actions = goal_adjustment[1] if goal_adjustment else (
             []
             if (
                 "conversation" in question_plan.topics

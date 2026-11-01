@@ -196,6 +196,10 @@ def resolve_goal_reference(
             matched_name=matched_name,
         )
 
+    # A pronoun is not a goal name (for example, "the button for my goal").
+    if re.search(r"\b(?:my|the|this|that)\s+goal\b(?!\s+(?:called|named)\b)", question, re.I):
+        return GoalReference(status="general", requested_name=None, matched_name=None)
+
     requested_name = None
     for pattern in _GOAL_NAME_PATTERNS:
         match = pattern.search(question)

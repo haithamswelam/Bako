@@ -11,6 +11,7 @@ function GoalForm({
   values,
   onChange,
   onSubmit,
+  onDelete,
   loading,
   submitLabel = "Create Goal"
 }) {
@@ -107,6 +108,11 @@ function GoalForm({
       <button className="primary-button pulse-button pulse-button-accent" type="submit" disabled={loading || !isValid}>
         {loading ? "Saving goal..." : submitLabel}
       </button>
+      {onDelete && (
+        <button className="pulse-button pulse-button-secondary" type="button" disabled={loading} onClick={onDelete}>
+          Delete goal
+        </button>
+      )}
     </form>
   );
 }
