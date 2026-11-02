@@ -5,7 +5,7 @@
 ##     (agent/env/reports/trace-*.jsonl). Each START step writes a
 ##     {"event": "stage", "id": ..., "status": ...} line; STOP is read from
 ##     its existing events.
-##   - Bako and OpenAI flow: from the last chat message's trace
+##   - Bako and AI flow: from the last chat message's trace
 ##     (a dict the chat code leaves in session_state["chat_trace"]).
 ## Click a box: what it does, what it found (evidence), likely cause if it failed,
 ## and a button that sends the step to Bako in the chat to troubleshoot.
@@ -14,16 +14,26 @@
 import glob, json, os, re, webbrowser
 import streamlit as st
 
-## ---- colours (same palette as the approved mockup; "warm" is the default) ----
+## ---- colours: "bako" is the new look (default); "warm" and "dark" keep the older palettes ----
 THEMES = {
+    "bako": dict(bg="#D9DBD2", card="#F3F4EF", inset="#E9EBE3", soft="#DADDD2", accent="#DDEB4A", border="#CBCFC2",
+                 ink="#1E211D", muted="#565B52", ink2="#33352F", light="#FFFFFF", deep="#33352F", onAccent="#1E211D",
+                 panel="#33352F", onPanel="#F3F4EF", panelAccent="#DDEB4A", dashA="#7C8175", dashB="#9AA08F",
+                 okBg="#DDEB4A", okFg="#1E211D", okLine="#33352F", badBg="#F8D9D4", badFg="#8A2A1B", badLine="#B3382A", notice="#E9EBE3",
+                 frame="#4E5049", onFrame="#D9DBD2", frameHover="#5A5C53", page="#D9DBD2", lime="#DDEB4A", onLime="#1E211D",
+                 node="#FFFFFF", nodeLine="#CBCFC2"),
     "warm": dict(bg="#EFEDEA", card="#FDFCFB", inset="#F5F3F0", soft="#E5E1DB", accent="#C4B8A8", border="#E6E2DC",
                  ink="#3B3834", muted="#635E57", ink2="#49453F", light="#F9F8F6", deep="#3B3834", onAccent="#3B3834",
                  panel="#3B3834", onPanel="#F9F8F6", panelAccent="#C4B8A8", dashA="#A9A49D", dashB="#CFCBC6",
-                 okBg="#D9F0E1", okFg="#17613A", okLine="#2E8B57", badBg="#F8D9D4", badFg="#8A2A1B", badLine="#B3382A", notice="#EEEBE6"),
+                 okBg="#D9F0E1", okFg="#17613A", okLine="#2E8B57", badBg="#F8D9D4", badFg="#8A2A1B", badLine="#B3382A", notice="#EEEBE6",
+                 frame="#EFEDEA", onFrame="#3B3834", frameHover="#E5E1DB", page="#E5E1DB", lime="#C4B8A8", onLime="#3B3834",
+                 node="#FDFCFB", nodeLine="#E6E2DC"),
     "dark": dict(bg="#1E1C1A", card="#292623", inset="#322E2A", soft="#413B34", accent="#C9BBA6", border="#3A3631",
                  ink="#ECE7DE", muted="#B3ABA0", ink2="#D8D2C7", light="#1E1C1A", deep="#ECE7DE", onAccent="#1E1C1A",
                  panel="#3A3631", onPanel="#ECE7DE", panelAccent="#D2C3A9", dashA="#7E776D", dashB="#5C564E",
-                 okBg="#22382A", okFg="#8FD6A8", okLine="#4E9A68", badBg="#4A2B27", badFg="#F4AFA3", badLine="#D9695A", notice="#3A342B"),
+                 okBg="#22382A", okFg="#8FD6A8", okLine="#4E9A68", badBg="#4A2B27", badFg="#F4AFA3", badLine="#D9695A", notice="#3A342B",
+                 frame="#1E1C1A", onFrame="#ECE7DE", frameHover="#292623", page="#262320", lime="#C9BBA6", onLime="#1E1C1A",
+                 node="#292623", nodeLine="#3A3631"),
 }
 
 ## ---- the flows: lanes of steps. id = the stage id the agent writes ----
@@ -32,11 +42,15 @@ def N(id, label, sub, what, ifFails, url=None):
 
 FLOWS = {
     "start": dict(title="Start Lab flow", lanes=[
-        dict(label="On your computer · the agent", then="then GitHub builds the images", nodes=[
+        dict(label="On your computer · the agent prepares", then="then you approve it", nodes=[
             N("acct", "Account check", "expected AWS account", "Runs checks.sh account. Everything stops if the AWS account is not the expected one.",
               "Wrong AWS profile or an expired login. Sign in again, then retry. Nothing was changed."),
+            N("dbfind", "Find saved database", "newest snapshot", "Looks for the newest saved copy of the database (an RDS snapshot made by the last STOP). If it finds one, terraform builds the new database FROM it instead of empty.",
+              "A failure here means AWS could not be read. Nothing was changed. If it says no snapshot exists, an empty database is created: normal only on the very first run."),
             N("plan", "Terraform plan", "what will be created", "Saves an exact plan file. It counts as clean only when it deletes nothing.",
               "A plan with deletes or errors usually means state drift or a missing variable. Read the plan output first."),
+        ]),
+        dict(label="On your computer · creating the lab", then="then GitHub builds the images", nodes=[
             N("appr", "Your approval", "you type approved", "The agent itself compares the word you typed. No other word counts.",
               "Any other word means no. The run stops and nothing is applied."),
             N("apply", "Terraform apply", "creates the lab", "Applies the exact saved plan file, nothing more.",
@@ -59,21 +73,27 @@ FLOWS = {
               "Red checks on the pull request: open it and read the failing check.", url="pr"),
             N("argo", "Argo CD sync", "deploys K8s/", "Argo CD deploys whatever is in K8s/ after your merge. Bako waits until it is Synced and Healthy at that commit.",
               "OutOfSync or Degraded. Look at the pod events: often ImagePullBackOff because the tag is not in ECR."),
+            N("dbchk", "Database check", "rows came back?", "Counts the rows in the new database through a short-lived pod and compares them with the counts saved on the snapshot at STOP.",
+              "Fewer rows than were saved means the restore is not what you expect. Do not use the lab until you know why. Skipped if the count could not run."),
             N("ready", "READY checks", "checks.sh ready", "Argo Healthy, pods Running with 0 restarts, running image tags exist in ECR.",
               "The failing row names the problem. Fix it, then run the checks again.")])]),
     "stop": dict(title="Stop Lab flow", lanes=[
-        dict(label="On your computer · the agent", then="", nodes=[
+        dict(label="On your computer · checks and your approval", then="then it saves the database", nodes=[
             N("s1", "Account check", "expected account", "Same check as START: stops if the AWS account is not the expected one.",
               "Wrong profile or expired login. Nothing is deleted."),
             N("s2", "Destroy plan", "only deletes", "Saves a plan that must delete resources and create or change none.",
               "A destroy plan with creates or changes means something is off. Read it before going on."),
             N("s3", "Your approval", "you type destroy bako", "The agent itself compares the word you typed.",
               "Any other word means no. Nothing is deleted."),
+        ]),
+        dict(label="On your computer · save, destroy, verify", then="", nodes=[
+            N("sdb", "Save database", "RDS snapshot", "Before anything is deleted, takes a snapshot of the database and waits until AWS says it is available. Keeps the newest 3. If it cannot be saved, the destroy is refused.",
+              "The destroy is refused on purpose, nothing was deleted. The line says why: database busy, AWS error, or the snapshot did not finish in 40 minutes."),
             N("s4", "Terraform destroy", "deletes the lab", "Runs the exact saved destroy plan.",
               "A resource that will not delete (often a load balancer or network interface). Delete it, then run again."),
             N("s5", "Nothing-running checks", "billing stopped?", "Checks that no cluster, node, NAT gateway, Elastic IP, database or load balancer is left billing.",
               "Any row that is not 0 is still costing money. The row names it.")])]),
-    "chat": dict(title="Bako and OpenAI", lanes=[
+    "chat": dict(title="Bako and AI", lanes=[
         dict(label="On your computer · bako_chat.py", then="the request goes out", nodes=[
             N("c1", "You ask", "your message", "Your message, plus the last 20 text messages of the conversation.", "An empty or very long message. Shorten it."),
             N("c2", "Build the request", "rules + history", "Adds the charter (the rules) and the first 6,000 characters of CHARTER.md. The model remembers nothing, so everything is sent again each time.",
@@ -171,11 +191,13 @@ def derive_stop(events, running):
         if ev == "step_result" and e.get("step") == "terraform_destroy":
             r = e.get("result", "")
             put("s4", "done" if r.startswith("destroy OK") else "failed", r[:300])
+        if ev == "stage" and e.get("id") == "sdb":
+            put("sdb", e.get("status", "waiting"), e.get("detail", ""))
         if ev == "outcome" and "nothing_running" in e:
             put("s5", "done" if e.get("nothing_running") else "failed",
                 "NOTHING RUNNING" if e.get("nothing_running") else "something is still running or the destroy was not confirmed")
     finished = any(e.get("event") == "stop" for e in events)
-    order = ["s1", "s2", "s3", "s4", "s5"]
+    order = ["s1", "s2", "s3", "sdb", "s4", "s5"]
     if running and not finished:
         for sid in order:
             if sid not in st:
@@ -223,7 +245,7 @@ def derive_chat(trace):
 
 
 ## ---------------------------------------------------------------
-## 1b. "WHAT HAPPENED THIS TIME" for the Bako and OpenAI boxes, built from the real trace
+## 1b. "WHAT HAPPENED THIS TIME" for the Bako and AI boxes, built from the real trace
 ## (the same box would otherwise say the same thing for every message)
 ## Returns dict(what, fails, tele) where tele = [(title, text_or_object, language)]
 ## ---------------------------------------------------------------
@@ -326,8 +348,10 @@ def chat_detail(node, trace):
             steps = "; ".join(f"{c['n']}) {c['name']}({_args_short(c['arguments'])})" for c in calls)
             out["what"] = f"The model asked for {len(calls)} tool call(s) of the {tr.get('max_tool_calls', 6)} allowed: {steps}. Our code ran each one and sent the result back."
         stop = tr.get("stopped_by")
-        if stop == "token_budget":
-            out["fails"] = f"This message hit the token budget ({tr.get('token_budget'):,}). Code stopped the tool use and forced an answer."
+        if stop in ("cost_budget", "token_budget"):
+            out["fails"] = (f"This message hit its cost budget (${tr.get('cost_budget')}) after spending ${tr.get('spent')}. "
+                            "Code stopped the tool use and forced an answer." if stop == "cost_budget" else
+                            "This message hit the token budget. Code stopped the tool use and forced an answer.")
         elif dups:
             out["fails"] = f"{dups} repeated call(s) were refused by code this time and the model was told to use the earlier result."
         elif len(calls) >= tr.get("max_tool_calls", 6):
@@ -365,14 +389,20 @@ def chat_detail(node, trace):
 ## 2. STYLE (one CSS block, built from the theme; one rule per box colour)
 ## ---------------------------------------------------------------
 def node_css(key, status, selected, t):
-    look = {"done": (t["okBg"], f"2px solid {t['okLine']}"), "running": (t["soft"], f"2px solid {t['ink']}"),
-            "failed": (t["badBg"], f"2px solid {t['badLine']}"), "waiting": (t["card"], f"2px dashed {t['dashA']}"),
-            "skipped": (t["inset"], f"2px dashed {t['dashB']}"), "unused": (t["inset"], f"2px dashed {t['dashB']}")}[status]
-    fg = {"done": t["okFg"], "failed": t["badFg"]}.get(status, t["muted"])
-    ring = f"box-shadow:0 0 0 3px {t['ink']};" if selected else ""
-    return (f".st-key-{key} button{{background:{look[0]} !important;border:{look[1]} !important;{ring}}}"
-            f".st-key-{key} button p{{color:{t['ink']} !important;}}"
-            f".st-key-{key} button p:first-child{{color:{fg} !important;font-weight:600;font-size:12px;}}")
+    look = {"done": (t["node"], t["nodeLine"], "solid"), "running": (t["deep"], t["deep"], "solid"),
+            "failed": (t["badBg"], t["badLine"], "solid"), "waiting": ("transparent", t["dashA"], "dashed"),
+            "skipped": ("transparent", t["dashB"], "dashed"), "unused": ("transparent", t["dashB"], "dashed")}[status]
+    bg, line, style = look
+    width = "2.5px" if selected else "1.5px"
+    if selected:
+        line, style = t["ink"], "solid"
+    fg = t["light"] if status == "running" else t["ink"]
+    chip = {"done": (t["lime"], t["onLime"], "none"), "running": (t["light"], t["deep"], "none"),
+            "failed": (t["badLine"], "#FFFFFF", "none")}.get(status, ("transparent", t["muted"], f"1.5px dashed {t['dashA']}"))
+    return (f".st-key-{key} button{{background:{bg} !important;border:{width} {style} {line} !important;}}"
+            f".st-key-{key} button p{{color:{fg} !important;}}"
+            f".st-key-{key} button p:first-child{{display:inline-block !important;width:auto !important;background:{chip[0]} !important;"
+            f"color:{chip[1]} !important;border:{chip[2]};border-radius:999px;padding:2px 10px;font-weight:700;font-size:11px !important;margin-bottom:8px !important;}}")
 
 BASE_CSS = """
 [class*="st-key-fn_"] button{width:100% !important;min-height:96px !important;height:100% !important;border-radius:16px !important;
@@ -383,14 +413,21 @@ BASE_CSS = """
 [class*="st-key-fn_"] button p{display:block !important;white-space:normal !important;overflow:visible !important;
   text-overflow:clip !important;margin:0 0 3px 0 !important;line-height:1.25;text-align:left !important;font-size:14px;}
 [class*="st-key-flowview_"] button,.st-key-flowdetail button{border-radius:999px !important;min-height:40px !important;padding:0 10px !important;font-size:14px !important;white-space:normal !important;}
-.fl-arrow{display:flex;align-items:center;justify-content:center;height:96px;font-size:20px;}
-.fl-lane{font-size:13px;font-weight:600;margin:6px 0 4px 2px;}
+.fl-arrow{position:relative;height:96px;}
+.fl-arrow::before{content:'';position:absolute;left:0;right:0;top:48px;height:1.5px;background:currentColor;}
+.fl-arrow i{position:absolute;left:50%;top:43px;width:10px;height:10px;margin-left:-5px;border-radius:50%;border:1.5px solid currentColor;}
+.fl-lane{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:700;margin:12px 0 6px 2px;}
+.fl-lane::before{content:'';width:14px;height:14px;border-radius:4px;border:1.5px solid currentColor;flex:none;}
+.fl-prog{height:10px;border-radius:99px;overflow:hidden;margin:4px 0 12px;}
+.fl-prog > div{height:100%;}
 .fl-then{display:flex;justify-content:center;gap:8px;font-size:12px;margin:2px 0 0 0;}
 .fl-pill{font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px;margin-left:10px;vertical-align:middle;}
 """
 
 def theme_css(t):
-    return (BASE_CSS + f".fl-arrow,.fl-then,.fl-lane{{color:{t['muted']};}}"
+    return (BASE_CSS + f".fl-then{{color:{t['muted']};}}.fl-arrow,.fl-lane{{color:{t['ink2']};}}"
+            f".fl-arrow i,.fl-lane::before{{background:{t['lime']};}}.fl-prog{{background:{t['soft']};}}"
+            f".fl-prog > div{{background:{t['lime']};border-right:2px solid {t['ink']};}}"
             f".st-key-flowdetail button{{background:transparent !important;border:2px solid {t['ink']} !important;}}"
             f".st-key-flowdetail button p{{color:{t['ink']} !important;white-space:normal !important;overflow:visible !important;text-overflow:clip !important;}}"
             f".st-key-flowdetail h3,.st-key-flowdetail p,.st-key-flowdetail li{{color:{t['ink']};}}"
@@ -419,7 +456,7 @@ def evidence_for(node, s, repo, view):
             extra = f"\n--- end of {os.path.basename(log)} ---\n" + tail(log, 900)
     return (text or "(no detail recorded)") + extra
 
-RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "ready"}   # steps after terraform apply
+RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "dbchk", "ready"}   # steps after terraform apply
 
 def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None):
     t = THEMES.get(theme, THEMES["warm"])
@@ -433,7 +470,7 @@ def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None,
     with st.container(key="flowbox"):
         vcss = []
         c1, c2, c3 = st.columns(3)
-        for col, vid, label in ((c1, "start", "Start Lab flow"), (c2, "stop", "Stop Lab flow"), (c3, "chat", "Bako and OpenAI")):
+        for col, vid, label in ((c1, "start", "Start Lab flow"), (c2, "stop", "Stop Lab flow"), (c3, "chat", "Bako and AI")):
             if col.button(label, key=f"flowview_{vid}", use_container_width=True, type="primary" if view == vid else "secondary"):
                 ss.flow_view = vid
                 st.rerun(scope="fragment")
@@ -444,6 +481,7 @@ def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None,
 
         ## facts
         stages, summary, run_file = {}, "", None
+        prog = None
         if view in ("start", "stop"):
             run_file, events = newest_run(repo, view)
             stages = derive_start(events, running) if view == "start" else derive_stop(events, running)
@@ -452,6 +490,7 @@ def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None,
             else:
                 total = sum(len(l["nodes"]) for l in FLOWS[view]["lanes"])
                 done = sum(1 for s in stages.values() if s["status"] in ("done", "skipped"))
+                prog = (done, total)
                 bad = [s for s in stages if stages[s]["status"] == "failed"]
                 first = next((e.get("time", "") for e in events if e.get("event") == "run_start"), "")
                 label = {n["id"]: n["label"] for l in FLOWS[view]["lanes"] for n in l["nodes"]}
@@ -463,6 +502,8 @@ def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None,
         else:
             stages, summary = derive_chat(chat_trace)
         st.caption(summary)
+        if prog and prog[1]:
+            st.markdown(f"<div class='fl-prog'><div style='width:{int(100 * prog[0] / prog[1])}%'></div></div>", unsafe_allow_html=True)
 
         ## the diagram
         sel_id = ss.flow_sel.get(view)
@@ -494,7 +535,7 @@ def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None,
                     st.rerun(scope="fragment")
                 ci += 1
                 if arrows and i < n - 1:
-                    cols[ci].markdown("<div class='fl-arrow'>→</div>", unsafe_allow_html=True)
+                    cols[ci].markdown("<div class='fl-arrow'><i></i></div>", unsafe_allow_html=True)
                     ci += 1
             if lane.get("then"):
                 st.markdown(f"<div class='fl-then'>↓ {lane['then']}</div>", unsafe_allow_html=True)

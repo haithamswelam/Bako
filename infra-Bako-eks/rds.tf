@@ -1,10 +1,18 @@
+## DATABASE RESTORE: the agent (stage "Find saved database") passes the newest RDS snapshot here.
+## "" (the default) = build an empty database, exactly as before.
+variable "db_snapshot_identifier" {
+  description = "RDS snapshot to build the database from. Empty = a new empty database."
+  type        = string
+  default     = ""
+}
+
 resource "random_password" "bako_db" {
   length  = 32
   special = false
 }
 
 resource "aws_secretsmanager_secret" "bako_db" {
-  name = "bako/db-credentials"
+  name                    = "bako/db-credentials"
   recovery_window_in_days = 0
 
   tags = {
@@ -63,8 +71,13 @@ resource "aws_db_instance" "bako" {
   allocated_storage = 20
   storage_type      = "gp3"
 
-  db_name                      = "bako"
-  username                     = "bako_admin"
+  ## Built FROM a snapshot when the agent found one, empty otherwise.
+  snapshot_identifier = var.db_snapshot_identifier == "" ? null : var.db_snapshot_identifier
+
+  ## A restore keeps the database name and the admin user stored in the snapshot, so they are only set for an empty database.
+  ## The password is always set: on a restore AWS applies the new one, and the secret above holds the same value.
+  db_name  = var.db_snapshot_identifier == "" ? "bako" : null
+  username = var.db_snapshot_identifier == "" ? "bako_admin" : null
   password = random_password.bako_db.result
 
   db_subnet_group_name   = aws_db_subnet_group.bako.name
@@ -72,10 +85,18 @@ resource "aws_db_instance" "bako" {
 
   publicly_accessible = false
   multi_az            = false
-  skip_final_snapshot = true
+  skip_final_snapshot = true ## the agent saves its own snapshot before every destroy (stage "Save database")
+
+  ## Keeps the engine at 16.15 so every snapshot can be restored by this same file.
+  auto_minor_version_upgrade = false
 
   tags = {
     Name = "bako-db"
+  }
+
+  lifecycle {
+    ## Changing the snapshot later must never replace a running database.
+    ignore_changes = [snapshot_identifier]
   }
 }
 
