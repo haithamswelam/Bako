@@ -11,8 +11,15 @@ metadata:
     alb.ingress.kubernetes.io/scheme: internet-facing
     # ip = the ALB talks straight to the pod addresses (VPC CNI gives pods real VPC IPs)
     alb.ingress.kubernetes.io/target-type: ip
-    # Step 1 is plain HTTP, so TEST DATA ONLY. Step 2 adds 443 + a certificate and redirects 80 to 443.
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+    # Step 2: HTTPS. Port 80 stays open only to answer with a redirect to 443; the certificate does the encryption.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # Certificate made by infra-Bako-persistent (README step D). START refuses to run if this ever holds the placeholder word again.
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-north-1:483272865934:certificate/d1be517a-c3d5-4c7e-b848-83c388c9c1b7
+    # Modern TLS only (TLS 1.2 and 1.3)
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    # ExternalDNS reads this and writes bako.awsbako.site -> the new ALB into Route 53 after every Start
+    external-dns.alpha.kubernetes.io/hostname: bako.awsbako.site
     # Who may connect. 0.0.0.0/0 = everyone. To allow only yourself, put your own address here, for example 203.0.113.7/32
     alb.ingress.kubernetes.io/inbound-cidrs: 0.0.0.0/0
     # The ALB marks a pod healthy when this path answers 200 (the frontend serves its homepage at /)
@@ -27,7 +34,8 @@ metadata:
 spec:
   ingressClassName: alb
   rules:
-    - http:
+    - host: bako.awsbako.site
+      http:
         paths:
           - path: /
             pathType: Prefix

@@ -726,6 +726,17 @@ def preflight_start():
         problems.append("bootstrap-cluster.sh was not found in the repo root")
     if not os.path.exists(".github/workflows/ci.yml"):
         problems.append(".github/workflows/ci.yml was not found")
+    if not os.path.exists("agent/env/install-externaldns.sh"):
+        problems.append("agent/env/install-externaldns.sh was not found (HTTPS step 2 is not installed)")
+    ## HTTPS: the Ingress must hold a real certificate ARN, not the placeholder word
+    try:
+        with open("K8s/ingress.yaml", encoding="utf-8") as fh:
+            ing = fh.read()
+        if "PASTE" in ing:
+            problems.append("K8s/ingress.yaml still has the placeholder PASTE_CERTIFICATE_ARN_HERE. "
+                            "Follow README-https-step2.txt steps A to D and paste the certificate ARN")
+    except OSError:
+        problems.append("K8s/ingress.yaml was not found")
     if GH:
         rc, out = run_cmd([GH, "auth", "status"], 30)
         if rc != 0:
@@ -1063,8 +1074,9 @@ def step_ready():
         return True if out["text"].rstrip().endswith("exit code: 0") else None
     if wait_for(good, 5 * 60):
         STATE["ready"] = True
-        stage("ready", "done")
+        stage("ready", "done", "Application: https://bako.awsbako.site (DNS can take a minute or two after a Start)")
         print(out["text"])
+        print("Application URL: https://bako.awsbako.site")
         return True
     print(out["text"])
     return fail("ready", "the READY checks did not all pass within 5 minutes:\n" + out["text"][-800:])
