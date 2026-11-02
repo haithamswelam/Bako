@@ -24,7 +24,7 @@ variable "domain_name" {
 
 variable "create_certificate" {
   type        = bool
-  default     = false
+  default     = true
   description = "false on the first apply (creates the zone). true on the second apply, AFTER the 4 NS records exist in Cloudflare, because the certificate is validated through that DNS."
 }
 
