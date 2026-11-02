@@ -20,7 +20,7 @@ MAX_SECONDS = 60 * 60                 # max run time: 60 minutes
 ##   plan_summary = the plan summary shown to the human before apply
 STATE = {"account_ok": False, "plan_ok": False, "plan_summary": "", "applied": False, "stop_now": "",
          "destroy_plan_ok": False, "destroy_summary": "", "destroyed": False, "nothing_running": False,
-         "ready": False, "stopped_at": "", "plan_counts": {}}
+         "ready": False, "stopped_at": "", "plan_counts": {}, "db_snapshot": "", "db_expect": {}}
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "dry"
 if MODE not in ("dry", "start", "stop"):
@@ -36,7 +36,7 @@ UNIX_ENV = shellenv.unix_env(BASH, {k: v for k, v in os.environ.items() if k != 
 
 ## "start --from <step>" re-runs START from one step after terraform apply (the lab must already exist).
 ORDER = ["boot", "trig", "bot", "merge", "argo", "ready"]
-ALIAS = {"test": "trig", "build": "trig", "push": "trig"}
+ALIAS = {"test": "trig", "build": "trig", "push": "trig", "dbchk": "argo"}
 FROM = ""
 if "--from" in sys.argv:
     i = sys.argv.index("--from")
@@ -121,8 +121,10 @@ def tool_terraform_plan():
     STATE["plan_ok"] = False        # any new plan starts as "not approved for apply"
     if not STATE["account_ok"]:
         return "REFUSED: the account check has not passed in this run. Run run_checks(account) first."
+    ## START found a saved database snapshot (stage dbfind): the new database is built from it
+    snap_args = [f"-var=db_snapshot_identifier={STATE['db_snapshot']}"] if STATE.get("db_snapshot") else []
     plan = subprocess.run(
-        [TERRAFORM, f"-chdir={TF_DIR}", "plan", "-input=false", "-no-color", f"-out={PLAN_FILE}"],
+        [TERRAFORM, f"-chdir={TF_DIR}", "plan", "-input=false", "-no-color", *snap_args, f"-out={PLAN_FILE}"],
         capture_output=True, text=True,
     )
     if plan.returncode != 0:
@@ -262,6 +264,12 @@ def tool_terraform_destroy():
     if answer != "destroy bako":
         STATE["stop_now"] = "human did not approve"
         return "REFUSED: the human did not approve. Do nothing more."
+    ## Step before everything: save the database. If it cannot be saved, nothing is destroyed.
+    print("Saving the database first (RDS snapshot)...")
+    if not save_database():
+        STATE["stop_now"] = "database not saved"
+        return ("REFUSED: the database could not be saved, so destroying the lab now would lose your data. Nothing was destroyed.\n"
+                "See the [sdb] line above for the reason.")
     ## Step before the destroy: take the load balancer away while the cluster still exists. Refuse if it is still there.
     print("Releasing the load balancer first (pre-destroy-alb.sh)...")
     released, note = release_load_balancer()
@@ -458,6 +466,243 @@ def stage(sid, status, detail=""):
 def fail(sid, detail):
     stage(sid, "failed", detail)
     STATE["stopped_at"] = sid
+
+## ---------------------------------------------------------------
+## DATABASE SAVE AND RESTORE  (our code, plain, the model is not involved)
+## Why: terraform destroy deletes the RDS database, and every START creates an empty one. So:
+##   STOP  -> stage "sdb":    take an RDS snapshot BEFORE anything is destroyed. If it cannot be saved, the destroy is
+##                            refused (fail-closed, like the load balancer). Keeps the newest DB_KEEP snapshots.
+##   START -> stage "dbfind": find the newest saved snapshot and hand it to terraform (-var db_snapshot_identifier=...),
+##                            so the new database is built FROM it.
+##   START -> stage "dbchk":  after Argo CD is up, count the rows and compare with the counts stored on the snapshot.
+## Snapshots are not in terraform state, so terraform destroy never deletes them.
+## ---------------------------------------------------------------
+DB_ID = os.environ.get("BAKO_DB_ID") or read_setting("DB_INSTANCE", "bako-db")
+DB_KEEP = max(1, int(os.environ.get("BAKO_DB_KEEP") or read_setting("DB_SNAPSHOTS_KEEP", "3")))
+DB_NAMESPACE = os.environ.get("BAKO_NAMESPACE", "bako")
+DB_SECRET = os.environ.get("BAKO_DB_SECRET", "bako-db-credentials")
+SNAP_RE = re.compile(r"^" + re.escape(DB_ID) + r"-\d{8}-\d{6}$")      # only snapshots this agent made
+DB_COUNT_TABLES = ("users", "transactions")
+
+def _json_from(text):
+    ## aws can print warnings next to the JSON: cut from the first { or [
+    starts = [i for i in (text.find("{"), text.find("[")) if i >= 0]
+    return json.loads(text[min(starts):]) if starts else None
+
+def db_instance():
+    ## ("ok", info) | ("absent", None) | ("error", text)
+    rc, out = run_cmd(aws_cmd("rds", "describe-db-instances", "--db-instance-identifier", DB_ID, "--output", "json"), 60, CLEAN_ENV)
+    if rc != 0:
+        return ("absent", None) if "DBInstanceNotFound" in out else ("error", out[-300:])
+    try:
+        return "ok", _json_from(out)["DBInstances"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return "error", "could not read the answer from aws: " + out[-200:]
+
+def db_snapshots():
+    ## ("ok", [manual snapshots made by this agent, newest first]) | ("error", text)
+    rc, out = run_cmd(aws_cmd("rds", "describe-db-snapshots", "--snapshot-type", "manual", "--output", "json"), 90, CLEAN_ENV)
+    if rc != 0:
+        return "error", out[-300:]
+    try:
+        snaps = _json_from(out)["DBSnapshots"]
+    except (ValueError, KeyError, TypeError):
+        return "error", "could not read the answer from aws: " + out[-200:]
+    mine = [s for s in snaps if SNAP_RE.match(s.get("DBSnapshotIdentifier", "")) and s.get("DBInstanceIdentifier") == DB_ID]
+    mine.sort(key=lambda s: str(s.get("SnapshotCreateTime", "")), reverse=True)
+    return "ok", mine
+
+def snapshot_tags(snap):
+    arn = snap.get("DBSnapshotArn")
+    if not arn:
+        return {}
+    rc, out = run_cmd(aws_cmd("rds", "list-tags-for-resource", "--resource-name", arn, "--output", "json"), 60, CLEAN_ENV)
+    if rc != 0:
+        return {}
+    try:
+        return {t["Key"]: t["Value"] for t in _json_from(out).get("TagList", [])}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+def counts_from_tags(tags):
+    got = {}
+    for table in DB_COUNT_TABLES:
+        v = tags.get("rows-" + table, "")
+        if v.isdigit():
+            got[table] = int(v)
+    return got if len(got) == len(DB_COUNT_TABLES) else {}
+
+def db_counts(inst):
+    ## Row counts, read through a short-lived pod INSIDE the cluster (RDS is private, your laptop cannot reach it).
+    ## The password is read by the pod from the cluster secret: it never passes through this program.
+    ## Returns ({table: n}, "") or ({}, reason). It never raises, and it only ever talks to the expected account's cluster.
+    if not KUBECTL:
+        return {}, "kubectl was not found"
+    rc, ctx = run_cmd([KUBECTL, "config", "current-context"], 20, CLEAN_ENV)
+    if rc != 0 or EXPECTED_ACCOUNT not in ctx:
+        return {}, "kubectl is not pointed at the expected account's cluster, so no query was sent"
+    rc, out = run_cmd([KUBECTL, "get", "secret", DB_SECRET, "-n", DB_NAMESPACE, "-o", "name"], 30, CLEAN_ENV)
+    if rc != 0:
+        return {}, f"secret {DB_SECRET} does not exist yet in namespace {DB_NAMESPACE}"
+    host = (inst.get("Endpoint") or {}).get("Address", "")
+    if not host:
+        return {}, "the database has no address yet"
+    pod = "bako-dbcount"
+    run_cmd([KUBECTL, "delete", "pod", pod, "-n", DB_NAMESPACE, "--ignore-not-found", "--wait=true"], 60, CLEAN_ENV)
+    sql = "select " + ", ".join(f"(select count(*) from {t})" for t in DB_COUNT_TABLES)
+    overrides = {"spec": {"containers": [{
+        "name": pod, "image": "postgres:16",
+        "command": ["psql", "-tA", "-F", ",", "-c", sql],
+        "env": [{"name": "PGHOST", "value": host},
+                {"name": "PGDATABASE", "value": inst.get("DBName") or "bako"},
+                {"name": "PGUSER", "valueFrom": {"secretKeyRef": {"name": DB_SECRET, "key": "username"}}},
+                {"name": "PGPASSWORD", "valueFrom": {"secretKeyRef": {"name": DB_SECRET, "key": "password"}}}]}]}}
+    rc, out = run_cmd([KUBECTL, "run", pod, "-n", DB_NAMESPACE, "--image=postgres:16", "--restart=Never", "--rm", "-i", "--quiet",
+                       "--overrides", json.dumps(overrides)], 240, CLEAN_ENV)
+    run_cmd([KUBECTL, "delete", "pod", pod, "-n", DB_NAMESPACE, "--ignore-not-found", "--wait=false"], 30, CLEAN_ENV)
+    m = re.search(r"^\s*(\d+(?:,\d+)+)\s*$", out, re.M)
+    if rc != 0 or not m:
+        return {}, "the count query did not return numbers: " + redact.redact(out.strip())[-200:]
+    nums = [int(x) for x in m.group(1).split(",")]
+    if len(nums) != len(DB_COUNT_TABLES):
+        return {}, "unexpected answer from the count query"
+    return dict(zip(DB_COUNT_TABLES, nums)), ""
+
+def fmt_counts(counts):
+    return ", ".join(f"{t} {n}" for t, n in counts.items()) if counts else "row counts unknown"
+
+def prune_snapshots(keep_name):
+    ## Delete OLD snapshots of this agent beyond the newest DB_KEEP. Runs only after the new one is verified.
+    st, snaps = db_snapshots()
+    if st != "ok":
+        return "could not list old snapshots to tidy up (" + snaps[:100] + ")"
+    old = [s for s in snaps if s["DBSnapshotIdentifier"] != keep_name and s.get("Status") == "available"]
+    removed = []
+    for s in old[max(0, DB_KEEP - 1):]:
+        rc, out = run_cmd(aws_cmd("rds", "delete-db-snapshot", "--db-snapshot-identifier", s["DBSnapshotIdentifier"]), 60, CLEAN_ENV)
+        if rc == 0:
+            removed.append(s["DBSnapshotIdentifier"])
+    return f"tidied up {len(removed)} older snapshot(s)" if removed else ""
+
+def save_database():
+    ## Returns True when it is safe to destroy: the database is saved, or there is no database to save.
+    stage("sdb", "running", f"looking for the database {DB_ID}")
+    st, inst = db_instance()
+    if st == "absent":
+        stage("sdb", "skipped", f"no database named {DB_ID} exists, so there is nothing to save")
+        return True
+    if st == "error":
+        stage("sdb", "failed", "could not read the database from AWS, so the destroy is refused: " + inst)
+        return False
+    status = inst.get("DBInstanceStatus", "")
+    if status != "available":
+        stage("sdb", "failed", f"the database is '{status}', not 'available'. A snapshot taken now could be incomplete, so the destroy is refused.")
+        return False
+    counts, why = db_counts(inst)
+    stage("sdb", "running", "rows now: " + (fmt_counts(counts) if counts else f"unknown ({why})") + ". Taking the snapshot...")
+    name = f"{DB_ID}-{time.strftime('%Y%m%d-%H%M%S')}"
+    tags = ["Key=bako-lab,Value=db-save"] + [f"Key=rows-{t},Value={n}" for t, n in counts.items()]
+    rc, out = run_cmd(aws_cmd("rds", "create-db-snapshot", "--db-instance-identifier", DB_ID,
+                              "--db-snapshot-identifier", name, "--tags", *tags), 120, CLEAN_ENV)
+    if rc != 0:
+        stage("sdb", "failed", "AWS refused to create the snapshot, so the destroy is refused: " + redact.redact(out)[-300:])
+        return False
+    deadline, last = time.time() + 40 * 60, ""
+    while time.time() < deadline:
+        rc, out = run_cmd(aws_cmd("rds", "describe-db-snapshots", "--db-snapshot-identifier", name, "--output", "json"), 60, CLEAN_ENV)
+        try:
+            snap = _json_from(out)["DBSnapshots"][0]
+        except (ValueError, KeyError, IndexError, TypeError):
+            snap = {}
+        s = snap.get("Status", "unknown")
+        line = f"snapshot {name}: {s}" + (f" {snap.get('PercentProgress')}%" if s == "creating" else "")
+        if line != last:
+            print("[sdb] " + line)
+            last = line
+        if s == "available":
+            note = prune_snapshots(name)
+            stage("sdb", "done", f"saved {name} ({snap.get('AllocatedStorage', '?')} GB allocated, {fmt_counts(counts)}). "
+                  f"The newest {DB_KEEP} are kept." + (" " + note if note else ""))
+            return True
+        if s in ("failed", "deleted", "incompatible-restore"):
+            break
+        time.sleep(POLL * 2)
+    stage("sdb", "failed", f"the snapshot {name} did not become available (last status: {last}). The destroy is refused.")
+    return False
+
+def tf_has_snapshot_variable():
+    try:
+        for fn in os.listdir(TF_DIR):
+            if fn.endswith(".tf"):
+                with open(os.path.join(TF_DIR, fn), encoding="utf-8", errors="replace") as f:
+                    if re.search(r'variable\s+"db_snapshot_identifier"', f.read()):
+                        return True
+    except OSError:
+        pass
+    return False
+
+def find_saved_database():
+    ## START, before the plan. Sets STATE["db_snapshot"] ("" = build an empty database) and STATE["db_expect"].
+    STATE["db_snapshot"], STATE["db_expect"] = "", {}
+    stage("dbfind", "running", "looking for a saved copy of the database")
+    st, inst = db_instance()
+    if st == "error":
+        stage("dbfind", "failed", "could not read the database from AWS: " + inst)
+        return False
+    if st == "ok":
+        stage("dbfind", "skipped", f"the database {DB_ID} already exists ({inst.get('DBInstanceStatus')}), nothing to restore")
+        return True
+    if os.environ.get("BAKO_DB_RESTORE", "").lower() == "off":
+        stage("dbfind", "skipped", "restore is switched off (BAKO_DB_RESTORE=off), so an EMPTY database will be created. Your snapshots are untouched.")
+        return True
+    sst, snaps = db_snapshots()
+    if sst != "ok":
+        stage("dbfind", "failed", "could not list the saved snapshots: " + snaps)
+        return False
+    good = [s for s in snaps if s.get("Status") == "available"]
+    if not good:
+        stage("dbfind", "skipped", "no saved snapshot exists yet, so an EMPTY database will be created (normal on the very first run)")
+        return True
+    snap = good[0]
+    sid = snap["DBSnapshotIdentifier"]
+    expect = counts_from_tags(snapshot_tags(snap))
+    if not tf_has_snapshot_variable():
+        stage("dbfind", "skipped", f"found {sid}, but the terraform files do not have the db_snapshot_identifier variable yet, "
+              "so an EMPTY database will be created. Add the terraform change from the README to restore it.")
+        return True
+    STATE["db_snapshot"], STATE["db_expect"] = sid, expect
+    stage("dbfind", "done", f"will restore {sid} ({snap.get('AllocatedStorage', '?')} GB, {fmt_counts(expect)})")
+    return True
+
+def step_db_check():
+    ## START, after Argo CD: count the rows and compare with what was saved. Needs the cluster secret, so it runs after Argo.
+    stage("dbchk", "running", "counting the rows in the database")
+    st, inst = db_instance()
+    if st != "ok":
+        stage("dbchk", "skipped", "could not read the database from AWS: " + (inst or "not found"))
+        return True
+    counts, why = {}, ""
+    for _ in range(12):                                   # the secret can take a minute to appear
+        counts, why = db_counts(inst)
+        if counts or "does not exist yet" not in why:
+            break
+        time.sleep(POLL)
+    if not counts:
+        stage("dbchk", "skipped", "could not count the rows: " + why)
+        return True
+    snap, expect = STATE.get("db_snapshot", ""), STATE.get("db_expect", {})
+    if not snap:
+        stage("dbchk", "done", "this is a fresh database (nothing was restored): " + fmt_counts(counts))
+        return True
+    if not expect:
+        stage("dbchk", "done", f"restored from {snap}: {fmt_counts(counts)} (the snapshot has no saved counts to compare)")
+        return True
+    short = {t: (counts.get(t, 0), n) for t, n in expect.items() if counts.get(t, 0) < n}
+    if short:
+        detail = "; ".join(f"{t}: {have} now, {want} saved" for t, (have, want) in short.items())
+        return fail("dbchk", f"the restored database has FEWER rows than the snapshot ({detail}). Do not use it until you know why.")
+    stage("dbchk", "done", f"restored from {snap}: {fmt_counts(counts)} (matches the saved {fmt_counts(expect)})")
+    return True
     return False
 
 def wait_for(fn, timeout_s, label=""):
@@ -590,6 +835,7 @@ def ci_stages(run_json):
 def wait_for_ci(run_id):
     ## Polls the run until it finishes. Returns (finished, conclusion, run_json).
     last = {}
+    seen_steps = {}
     def poll():
         rc, out = run_cmd([GH, "run", "view", str(run_id), "--json", "status,conclusion,jobs,headSha,url"], 60, stdout_only=True)
         if rc != 0:
@@ -598,6 +844,17 @@ def wait_for_ci(run_id):
             data = json.loads(out)
         except ValueError:
             return None
+        ## show the GitHub job steps in the terminal as they change (print only: nothing else depends on it)
+        if data.get("url") and "url" not in seen_steps:
+            seen_steps["url"] = data["url"]
+            print(redact.redact("[ci] GitHub run: " + data["url"]))
+        for job in data.get("jobs", []):
+            for sp in job.get("steps", []):
+                state = sp.get("conclusion") or sp.get("status") or ""
+                key = f"{job.get('name')}/{sp.get('name')}"
+                if state and state not in ("queued", "pending") and seen_steps.get(key) != state:
+                    seen_steps[key] = state
+                    print(redact.redact(f"[ci] {job.get('name')} / {sp.get('name')}: {state}"))
         for sid, st in ci_stages(data).items():
             if st == "waiting" and data.get("status") == "completed" and data.get("conclusion") == "success":
                 st = "skipped"                  # this workflow has no job for that box
@@ -783,6 +1040,12 @@ def step_argo():
         if line != seen["s"]:
             seen["s"] = line
             print("Argo CD:", line)
+        waiting_on = [f"{r.get('kind')}/{r.get('name')} {r.get('status')}/{(r.get('health') or {}).get('status', '-')}"
+                      for r in st.get("resources", [])
+                      if r.get("status") != "Synced" or (r.get("health") or {}).get("status") not in (None, "Healthy")]
+        if waiting_on and waiting_on != seen.get("b"):
+            seen["b"] = waiting_on
+            print(redact.redact("Argo CD still waiting on: " + "; ".join(waiting_on[:6])))
         if sync == "Synced" and health == "Healthy" and (not want or rev == want):
             return line
         return None
@@ -818,10 +1081,13 @@ def run_start():
     stage("acct", "done")
     if FROM:
         print(f"\n>> Resuming START from '{FROM}'. Plan and apply are not repeated.")
-        for sid in ("plan", "appr", "apply"):
+        for sid in ("dbfind", "plan", "appr", "apply"):
             stage(sid, "skipped", "done in an earlier run")
         STATE["applied"] = True
         run_tail(ORDER.index(FROM))
+        return
+    if not find_saved_database():
+        STATE["stopped_at"] = "dbfind"
         return
     stage("plan", "running")
     print("\n>> Planning (read-only)")
@@ -854,7 +1120,7 @@ def run_tail(first):
     ## Everything after terraform apply. first = position in ORDER to begin at (0 = from the bootstrap).
     ## Steps before it are shown as skipped ("done in an earlier run").
     boxes = {"boot": ["boot"], "trig": ["trig", "test", "build", "push"], "bot": ["bot"],
-             "merge": ["merge"], "argo": ["argo"], "ready": ["ready"]}
+             "merge": ["merge"], "argo": ["argo", "dbchk"], "ready": ["ready"]}
     for key in ORDER[:first]:
         for sid in boxes[key]:
             stage(sid, "skipped", "done in an earlier run")
@@ -890,6 +1156,8 @@ def run_tail(first):
             STATE["merge_oid"] = ""            # resumed later: any revision is fine, it must be Synced and Healthy
     if first <= 4:
         if not step_argo():
+            return
+        if not step_db_check():
             return
     step_ready()
 

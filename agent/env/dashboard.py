@@ -75,14 +75,14 @@ def get_client():
 ## The palette lives in flow_tab.THEMES so the Flow tab and the rest of the page always agree.
 ## ---------------------------------------------------------------
 ss = st.session_state
-THEME_FILE = os.path.join(os.path.expanduser("~"), ".bako_theme")
+THEME_FILE = os.path.join(os.path.expanduser("~"), ".bako_theme_v2")   # new file name: the new look is the default
 def load_theme():
     try:
         with open(THEME_FILE, encoding="utf-8") as f:
             name = f.read().strip()
-        return name if name in flow_tab.THEMES else "warm"
+        return name if name in flow_tab.THEMES else "bako"
     except OSError:
-        return "warm"
+        return "bako"
 def save_theme(name):
     try:
         with open(THEME_FILE, "w", encoding="utf-8") as f:
@@ -96,7 +96,7 @@ T = flow_tab.THEMES[ss.theme]
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&display=swap');
 html, body, [class*="css"], .stApp, button, input, textarea { font-family: 'Outfit', system-ui, sans-serif !important; }
-.stApp { background: @bg@; color: @ink@; }
+.stApp { background: @frame@; color: @ink@; }
 .stApp p, .stApp label, .stApp li, .stApp h1, .stApp h2, .stApp h3, .stApp [data-testid="stMarkdownContainer"] { color: @ink@; }
 .stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stCaptionContainer"] p { color: @muted@; }
 header[data-testid="stHeader"] { background: transparent; }
@@ -106,7 +106,18 @@ section[data-testid="stSidebar"] { background: @card@; }
 [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="stExpandSidebarButton"] { display: none !important; }
 section[data-testid="stSidebar"][aria-expanded="false"] { transform: none !important; margin-left: 0 !important; min-width: 300px !important; width: 300px !important; visibility: visible !important; }
 section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] h3 { color: @ink@; }
-.st-key-hdr { background: linear-gradient(135deg, @soft@ 0%, @light@ 70%); border-radius: 28px; padding: 26px 30px; }
+.st-key-hdr { background: transparent; padding: 2px 6px 16px; }
+.st-key-hdr, .st-key-hdr div, .st-key-hdr span, .st-key-hdr p { color: @onFrame@; }
+.st-key-hdr .hello { font-size: 32px; font-weight: 600; }
+.st-key-hdr .stButton button { border-color: @onFrame@; background: transparent; }
+.st-key-hdr .stButton button p { color: @onFrame@ !important; }
+.st-key-hdr .stButton button[kind="primary"], .st-key-hdr .stButton button[data-testid="stBaseButton-primary"] { background: @lime@; border-color: @lime@; }
+.st-key-hdr .stButton button[kind="primary"] p, .st-key-hdr .stButton button[data-testid="stBaseButton-primary"] p { color: @onLime@ !important; }
+section[data-testid="stSidebar"] .stButton button { padding: 0 8px; font-size: 14px; }
+.stTabs .stButton button { padding: 0 14px; }
+.st-key-pendingbox { background: @card@; border-radius: 22px; padding: 16px 20px; margin-bottom: 14px; }
+.pagenote { display: flex; align-items: center; gap: 12px; background: @inset@; border-radius: 999px; padding: 10px 20px 10px 12px; font-size: 14px; margin-bottom: 16px; }
+.pagenote .i { flex: none; width: 28px; height: 28px; border-radius: 50%; background: @lime@; color: @onLime@; display: flex; align-items: center; justify-content: center; font-weight: 700; }
 .st-key-chat, .st-key-checks, .st-key-detail { background: @card@; border-radius: 24px; padding: 20px 22px; }
 .st-key-detail { margin-top: 14px; }
 .st-key-today { background: @panel@; border-radius: 24px; padding: 20px 22px; }
@@ -155,13 +166,18 @@ button[data-variant="segmented_control"][aria-checked="true"] p, button[data-var
 .stButton button[kind="primary"], .stButton button[data-testid="stBaseButton-primary"] { background: @deep@; color: @light@; }
 .stButton button[kind="primary"] p, .stButton button[data-testid="stBaseButton-primary"] p { color: @light@; }
 .stButton button:disabled { opacity: 0.4; cursor: not-allowed; }
-.stTabs [role="tablist"], .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-.stTabs [role="tab"], .stTabs [data-baseweb="tab"] { border-radius: 999px !important; padding: 8px 20px !important; height: auto !important;
-    background: @inset@ !important; color: @ink@ !important; border-bottom: none !important; box-shadow: none !important; }
-.stTabs [role="tab"] p, .stTabs [data-baseweb="tab"] p { color: @ink@ !important; }
-.stTabs [role="tab"][aria-selected="true"], .stTabs [data-baseweb="tab"][aria-selected="true"] { background: @deep@ !important; }
-.stTabs [role="tab"][aria-selected="true"] p, .stTabs [data-baseweb="tab"][aria-selected="true"] p { color: @light@ !important; }
+.stTabs [role="tablist"], .stTabs [data-baseweb="tab-list"] { gap: 6px; padding: 0 0 0 40px; background: transparent !important; border-bottom: none !important; overflow: visible !important; }
+.stTabs [role="tab"], .stTabs [data-baseweb="tab"] { position: relative; border-radius: 18px 18px 0 0 !important; padding: 0 22px !important; height: 48px !important;
+    background: transparent !important; border: none !important; box-shadow: none !important; margin: 0 !important; }
+.stTabs [role="tab"] p, .stTabs [data-baseweb="tab"] p { color: @onFrame@ !important; font-weight: 600 !important; font-size: 15px !important; }
+.stTabs [role="tab"]:hover { background: @frameHover@ !important; }
+.stTabs [role="tab"][aria-selected="true"], .stTabs [data-baseweb="tab"][aria-selected="true"] { background: @page@ !important; z-index: 2; }
+.stTabs [role="tab"][aria-selected="true"] p, .stTabs [data-baseweb="tab"][aria-selected="true"] p { color: @ink@ !important; }
+.stTabs [role="tab"][aria-selected="true"]::before, .stTabs [role="tab"][aria-selected="true"]::after { content: ''; position: absolute; bottom: 0; width: 18px; height: 18px; }
+.stTabs [role="tab"][aria-selected="true"]::before { left: -18px; background: radial-gradient(circle at top left, transparent 17.5px, @page@ 18px); }
+.stTabs [role="tab"][aria-selected="true"]::after { right: -18px; background: radial-gradient(circle at top right, transparent 17.5px, @page@ 18px); }
 .stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"], .stTabs .react-aria-SelectionIndicator { display: none !important; background: transparent !important; }
+.stTabs [role="tabpanel"], .stTabs [data-baseweb="tab-panel"] { background: @page@; border-radius: 28px; padding: 20px 20px 24px !important; margin-top: -1px; position: relative; }
 [data-testid="stChatInput"], [data-testid="stChatInput"] > div { background: @card@; border-color: @ink@; }
 [data-testid="stChatInput"] textarea { color: @ink@; background: transparent; }
 [data-testid="stChatInput"] textarea::placeholder { color: @muted@ !important; opacity: 1 !important; }
@@ -259,7 +275,8 @@ def get_pods():
 ## Today's results, read from the agent's trace files.
 STAGE_LABELS = {"apply": "Terraform apply finished", "boot": "Cluster set up (bootstrap)", "trig": "Build requested on GitHub",
                 "build": "Images built", "push": "Images pushed to ECR", "bot": "Bot pull request opened",
-                "merge": "Pull request merged", "argo": "Argo CD synced", "ready": "READY checks all pass"}
+                "merge": "Pull request merged", "argo": "Argo CD synced", "ready": "READY checks all pass",
+                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked"}
 
 def todays_events():
     events = []
@@ -503,6 +520,9 @@ def drain():
             ss.awaiting = "destroy bako" if "DESTROY" in line else "approved"
         if "tail -f " in line:
             ss.logfile = line.split("tail -f ", 1)[1].strip()
+        m = re.search(r"Log: (\S+\.log)", line)        # later steps (bootstrap...) announce their log this way
+        if m:
+            ss.logfile = m.group(1)
 
 def send_to_agent(text):
     try:
@@ -551,7 +571,7 @@ def handle(text):
         return handle_keywords(text)
     ss.tokens += used
     usage.add_chat_tokens(REPO, used)           # kept for the daily report
-    ## what the Flow tab shows for "Bako and OpenAI" (tool details need bako_chat.LAST_TOOLS)
+    ## what the Flow tab shows for "Bako and AI" (tool details need bako_chat.LAST_TOOLS)
     ss.chat_trace = {"question": text, "tools": getattr(bako_chat, "LAST_TOOLS", None),
                      "tokens": used, "model": MODEL, "proposal": (action or {}).get("type"),
                      "trace": getattr(bako_chat, "LAST_TRACE", None)}
@@ -581,6 +601,7 @@ def finish_run_if_done():
     ss.chat.append(("assistant", "```\n" + "\n".join(ss.log) + "\n```"))
     results = [l for l in ss.log if l.startswith("RESULT (from code)")]
     say("**" + results[-1] + "**" if results else f"The run ended (exit code {code}).")
+    ss.term_last, ss.term_code = list(ss.log), code      # the terminal keeps showing the last run until the next one
     ss.proc, ss.log, ss.awaiting, ss.logfile = None, [], None, None
     ss.need_refresh = True                    # the lab changed: read it again
     return True
@@ -683,6 +704,113 @@ def code_pr_card():
                 say("Cancelled. Nothing was merged. The pull request is still open on GitHub.")
                 ss.code_pr = None; code_pr_save(); st.rerun()
 
+## ---------------------------------------------------------------
+## 7b. THE TERMINAL DOCK
+## One fixed-size window at the bottom of the page: it never grows. Inside it the output scrolls
+## (it stays at the newest line; scroll up to read earlier steps). The two round buttons minimize
+## and maximize it. It shows the live run, and after the run it keeps the last output.
+## ---------------------------------------------------------------
+TERM_H = {"open": 250, "min": 56, "max": 620}
+
+def _term_row(line):
+    s = html.escape(line)
+    up = line.upper()
+    cls = "tx"
+    if any(w in up for w in ("FAIL", "REFUSED", "ERROR", "TRACEBACK")):
+        cls = "tm-bad"
+    elif any(w in up for w in ("WAITING", "APPROVAL NEEDED", "MERGE PULL REQUEST", "YOUR TURN")):
+        cls = "tm-wt"
+    elif up.startswith("PASS") or up.endswith(": SUCCESS") or " DONE" in up or up.startswith("RESULT") or "ALL CHECKS PASSED" in up:
+        cls = "tm-ok"
+    m = re.match(r"^(\[[^\]]{1,24}\])\s?(.*)$", s)
+    if m:
+        return f"<div class='tm-ln {cls}'><span class='tm-tg'>{m.group(1)}</span>{m.group(2)}</div>"
+    return f"<div class='tm-ln {cls}'>{s or '&nbsp;'}</div>"
+
+def last_run_from_trace():
+    ## After a restart of the window the live output is gone; the newest trace file still has every step.
+    files = sorted(glob.glob(os.path.join(REPO, "agent", "env", "reports", "trace-*.jsonl")), reverse=True)
+    lines, mode = [], ""
+    if files:
+        try:
+            with open(files[0], encoding="utf-8", errors="replace") as f:
+                for raw in f:
+                    try:
+                        e = json.loads(raw)
+                    except ValueError:
+                        continue
+                    t = str(e.get("time", ""))[:8]
+                    if e.get("event") == "run_start":
+                        mode = e.get("mode", "")
+                        lines.append(f"[run] STARTED: {mode.upper()}  ({t})")
+                    elif e.get("event") == "stage":
+                        d = (e.get("detail") or "").replace("\n", " ")[:160]
+                        lines.append(f"[{e.get('id')}] {str(e.get('status', '')).upper()}" + (f": {d}" if d else "") + f"  ({t})")
+        except OSError:
+            pass
+    return lines, mode
+
+def terminal_dock():
+    live = ss.proc is not None
+    lines = list(ss.log) if live else list(ss.get("term_last") or [])
+    from_record, rec_mode = False, ""
+    if not lines and not live:
+        lines, rec_mode = last_run_from_trace()          # nothing ran in this window: show the last recorded run
+        from_record = True
+    state = ss.get("term") or ("min" if from_record else "open")
+    h = TERM_H.get(state, TERM_H["open"])
+    mode = (ss.lastmode or rec_mode or "run").upper()
+    if live:
+        chip = "waiting for you" if ss.awaiting else "live"
+    elif from_record:
+        chip = "last run" if lines else "idle"
+    else:
+        chip = "done" if ss.get("term_code", 0) == 0 else "ended with errors"
+    rows = lines[-400:] or ["Nothing has run yet. Press Start lab or Stop lab and the output appears here."]
+    if live and ss.logfile:
+        path = os.path.join(REPO, ss.logfile)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                tail = f.read().splitlines()[-20:]
+            rows = rows + [f"-- {os.path.basename(path).split('-')[0]} log, last lines --"] + tail
+    last = next((l.strip() for l in reversed(lines) if l.strip()), "no run yet")
+    if len(last) > 90:
+        last = last[:87] + "..."
+    st.markdown(f"""<style>
+.st-key-term{{background:#22241F;border-radius:20px;padding:0 14px 0 20px;box-shadow:0 18px 40px rgba(30,33,29,.28);height:{h}px;min-height:{h}px;max-height:{h}px;flex:none;overflow:hidden;gap:0 !important;}}
+[data-testid="stMainBlockContainer"]{{min-height:100vh;display:flex;flex-direction:column;padding-bottom:14px !important;}}
+[data-testid="stMainBlockContainer"] > [data-testid="stVerticalBlock"]{{flex:1;}}
+[data-testid="stLayoutWrapper"]:has(.st-key-term), [data-testid="stElementContainer"]:has(.st-key-term){{position:sticky;bottom:14px;z-index:60;margin-top:auto;}}
+.st-key-term [data-testid="stHorizontalBlock"]{{align-items:center;height:56px;gap:8px;}}
+.st-key-term .tm-h{{display:flex;align-items:center;gap:12px;color:#E7E9DF;font-size:14px;overflow:hidden;white-space:nowrap;}}
+.st-key-term .tm-h b{{font-weight:700;color:#E7E9DF;}}
+.st-key-term .tm-h .tm-chip{{background:{T['lime']};color:{T['onLime']};border-radius:999px;padding:2px 11px;font-size:12px;font-weight:700;}}
+.st-key-term .tm-h .tm-sub{{color:#B5B9AA;font-size:12px;overflow:hidden;text-overflow:ellipsis;}}
+.st-key-term .stButton button{{width:36px;min-height:36px;height:36px;padding:0;border-radius:999px;border:1px solid #4A4D44;background:transparent;}}
+.st-key-term .stButton button p, .st-key-term .stButton button span{{color:#E7E9DF !important;}}
+.st-key-term .tm-body{{height:{max(h - 70, 0)}px;display:flex;flex-direction:column-reverse;overflow-y:auto;overscroll-behavior:contain;}}
+.st-key-term .tm-in{{flex:none;font-family:'JetBrains Mono',ui-monospace,Consolas,monospace;font-size:12.5px;line-height:1.7;padding-bottom:6px;}}
+.tm-ln{{color:#E7E9DF;white-space:pre-wrap;word-break:break-word;}}
+.tm-ln.tm-ok{{color:{T['lime']};}} .tm-ln.tm-wt{{color:#F2C879;}} .tm-ln.tm-bad{{color:#F4A58E;}}
+.tm-tg{{color:{T['lime']};display:inline-block;min-width:92px;}}
+.tm-body::-webkit-scrollbar{{width:10px;}} .tm-body::-webkit-scrollbar-thumb{{background:#4A4D44;border-radius:99px;}}
+</style>""", unsafe_allow_html=True)
+    with st.container(key="term"):
+        c0, c1, c2 = st.columns([14, 1, 1])
+        c0.markdown(f"<div class='tm-h'><span class='tm-chip'>{html.escape(chip)}</span><b>Terminal · {html.escape(mode)}</b>"
+                    f"<span class='tm-sub'>now: {html.escape(last)}</span></div>", unsafe_allow_html=True)
+        if c1.button("", key="term_min", icon=":material/remove:" if state != "min" else ":material/expand_less:",
+                     help="Minimize" if state != "min" else "Restore"):
+            ss.term = "open" if state == "min" else "min"
+            st.rerun(scope="fragment")
+        if c2.button("", key="term_max", icon=":material/open_in_full:" if state != "max" else ":material/close_fullscreen:",
+                     help="Maximize" if state != "max" else "Restore size"):
+            ss.term = "open" if state == "max" else "max"
+            st.rerun(scope="fragment")
+        if state != "min":
+            st.markdown("<div class='tm-body'><div class='tm-in'>" + "".join(_term_row(r) for r in rows) + "</div></div>",
+                        unsafe_allow_html=True)
+
 def live_panel():
     if ss.proc is not None:
         if finish_run_if_done():
@@ -743,16 +871,6 @@ def live_panel():
                                 st.rerun(scope="fragment")
                     if ss.get("merge_msg"):
                         st.info(ss.merge_msg)
-        ## live output of the running agent
-        with st.container(key="runbox"):
-            st.code("\n".join(ss.log[-40:]) or "starting...", language=None)
-            if ss.logfile:
-                path = os.path.join(REPO, ss.logfile)
-                if os.path.exists(path):
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        tail = f.read().splitlines()[-12:]
-                    st.caption("Live terraform log (last lines)")
-                    st.code("\n".join(tail), language=None)
     elif ss.job is not None and not ss.job[0].is_alive():
         st.rerun()                            # the background check finished: show its result
 
@@ -810,13 +928,13 @@ with st.sidebar:
         ss.page = "reports" if ss.get("page") != "reports" else "lab"
         st.rerun()
     st.caption("Appearance")
-    ta, tb = st.columns(2)
-    if ta.button("Warm grey", key="theme_warm", use_container_width=True, type="primary" if ss.theme == "warm" else "secondary"):
-        ss.theme = "warm"; save_theme("warm"); st.rerun()
-    if tb.button("Dark", key="theme_dark", use_container_width=True, type="primary" if ss.theme == "dark" else "secondary"):
-        ss.theme = "dark"; save_theme("dark"); st.rerun()
+    ta, tb, tc = st.columns(3)
+    for _col, _name, _label in ((ta, "bako", "Bako"), (tb, "warm", "Warm"), (tc, "dark", "Dark")):
+        if _col.button(_label, key="theme_" + _name, use_container_width=True, type="primary" if ss.theme == _name else "secondary"):
+            ss.theme = _name; save_theme(_name); st.rerun()
 
 if ss.get("page") == "reports":
+    st.markdown("<style>.block-container{background:" + T["page"] + ";border-radius:28px;padding:28px !important;margin:16px 16px 0 0;}</style>", unsafe_allow_html=True)
     reports_page()
     st.stop()
 
@@ -855,19 +973,25 @@ with main:
     ## --- a proposed commit + push waits for "push bako" ---
     if ss.pending:
         a = ss.pending
-        st.warning(bako_chat.describe_action(a))
-        stamp = a["branch"].rsplit("-", 2)[-2] + "-" + a["branch"].rsplit("-", 1)[-1]
-        label = st.text_input("Branch name (optional): a few words, for example prmerge-fix. Bako adds the bako/update- start and the time.",
-                              key="branch_label_" + stamp, placeholder="leave empty for the automatic name")
-        a["branch"] = bako_chat.branch_for(label, stamp)
-        st.caption(f"The branch will be: {a['branch']}")
+        with st.container(key="pendingbox"):
+            st.warning(bako_chat.describe_action(a))
+            stamp = a["branch"].rsplit("-", 2)[-2] + "-" + a["branch"].rsplit("-", 1)[-1]
+            label = st.text_input("Branch name (optional): a few words, for example prmerge-fix. Bako adds the bako/update- start and the time.",
+                                  key="branch_label_" + stamp, placeholder="leave empty for the automatic name")
+            a["branch"] = bako_chat.branch_for(label, stamp)
+            st.caption(f"The branch will be: {a['branch']}")
     if ss.code_pr:
         code_pr_card()
 
     ## --- tabs ---
-    t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs(["Lab", "Flow", "AWS", "Cluster", "Repo"])
+    t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs([":material/science: Lab", ":material/account_tree: Flow", ":material/cloud: AWS",
+                                                         ":material/hub: Cluster", ":material/folder: Repo"])
+    def page_note(text):
+        st.markdown(f"<div class='pagenote'><span class='i'>i</span><span><b>On this page:</b> {html.escape(text)}</span></div>",
+                    unsafe_allow_html=True)
 
     with t_lab:
+        page_note("is the lab up, what it costs so far, and the checks that prove it works. Use Start lab and Stop lab at the top.")
         pods = None if running or not snap else snap["pods"]
         cost = f"${hours * HOURLY:.2f}" if hours is not None else ("$0.00" if state == "DOWN" else "—")
         kpis = [
@@ -913,6 +1037,7 @@ with main:
                     st.rerun()
 
     with t_flow:
+        page_note("every step of a START or STOP, in order. Click a box to see what the step does and what to do if it fails.")
         def ask_bako(text):
             ss.flow_prompt = redact.redact(text)      # secrets hidden; picked up by the chat box after the next full re-run
         def rerun_from(stage_id):
@@ -923,10 +1048,13 @@ with main:
                       on_rerun=rerun_from)
 
     with t_infra:
+        page_note("what AWS is running for the lab, and whether anything is still billing.")
         tabs.aws_tab(dict(repo=REPO, env=UENV, bash=BASH, T=T, hourly=HOURLY, up_now=up_now))
     with t_cluster:
+        page_note("the programs (pods) running inside the cluster, the machines they run on, and recent warnings. Click a row to see details on the right.")
         tabs.cluster_tab(dict(repo=REPO, env=UENV, kubectl=KUBECTL, state=state, T=T))
     with t_repo:
+        page_note("your code on GitHub: recent CI runs, pull requests and your uncommitted changes. Click a row to see details on the right.")
         tabs.repo_tab(dict(repo=REPO, env=UENV, gh=GHCLI, T=T))
 
 with side:
@@ -973,3 +1101,6 @@ with side:
 
     ## --- details of the row you clicked on the Repo or Cluster tab ---
     tabs.detail_panel(dict(repo=REPO, env=UENV, gh=GHCLI, kubectl=KUBECTL))
+
+## --- the terminal dock: fixed size, at the bottom of the page, refreshes by itself while a run is active ---
+st.fragment(terminal_dock, run_every=1 if busy else None)()
