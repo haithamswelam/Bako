@@ -276,7 +276,7 @@ def get_pods():
 STAGE_LABELS = {"apply": "Terraform apply finished", "boot": "Cluster set up (bootstrap)", "trig": "Build requested on GitHub",
                 "build": "Images built", "push": "Images pushed to ECR", "bot": "Bot pull request opened",
                 "merge": "Pull request merged", "argo": "Argo CD synced", "ready": "READY checks all pass",
-                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked"}
+                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked", "dns": "DNS name checked"}
 
 def todays_events():
     events = []

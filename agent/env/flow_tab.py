@@ -66,15 +66,19 @@ FLOWS = {
               "Usually a Dockerfile or dependency error. The failed log shows the exact line.", url="run"),
             N("push", "Push to ECR", "needs the AWS role", "Signs in to AWS with the OIDC role and pushes both images to ECR.",
               "The AWS role was not found or does not trust this run. A role created minutes ago can take about a minute to work; Bako retries once by itself.", url="run")]),
-        dict(label="Pull request · Argo CD and you", then="", nodes=[
+        dict(label="Pull request · Argo CD and you", then="then the cluster is checked", nodes=[
             N("bot", "Bot pull request", "image tags bumped", "After a good build, CI opens a pull request that changes the image tags in K8s/.",
               "No pull request after 10 minutes means the build did not finish. Check the CI run.", url="pr"),
             N("merge", "Your merge", "you click Merge", "You merge the bot pull request on GitHub. Bako never merges it for you.",
               "Red checks on the pull request: open it and read the failing check.", url="pr"),
             N("argo", "Argo CD sync", "deploys K8s/", "Argo CD deploys whatever is in K8s/ after your merge. Bako waits until it is Synced and Healthy at that commit.",
               "OutOfSync or Degraded. Look at the pod events: often ImagePullBackOff because the tag is not in ECR."),
+        ]),
+        dict(label="On the cluster · checks", then="", nodes=[
             N("dbchk", "Database check", "rows came back?", "Counts the rows in the new database through a short-lived pod and compares them with the counts saved on the snapshot at STOP.",
               "Fewer rows than were saved means the restore is not what you expect. Do not use the lab until you know why. Skipped if the count could not run."),
+            N("dns", "DNS name check", "bako.awsbako.site", "ExternalDNS is running and has written the name into Route 53, pointing at the load balancer that exists now.",
+              "Pod not running or no record after 6 minutes. The lab is still up: use the load balancer address (kubectl get ingress bako -n bako) and read kubectl -n kube-system logs deployment/external-dns."),
             N("ready", "READY checks", "checks.sh ready", "Argo Healthy, pods Running with 0 restarts, running image tags exist in ECR.",
               "The failing row names the problem. Fix it, then run the checks again.")])]),
     "stop": dict(title="Stop Lab flow", lanes=[
@@ -456,7 +460,7 @@ def evidence_for(node, s, repo, view):
             extra = f"\n--- end of {os.path.basename(log)} ---\n" + tail(log, 900)
     return (text or "(no detail recorded)") + extra
 
-RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "dbchk", "ready"}   # steps after terraform apply
+RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "dbchk", "dns", "ready"}   # steps after terraform apply
 
 def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None):
     t = THEMES.get(theme, THEMES["warm"])
