@@ -62,6 +62,7 @@ helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-contro
   --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="$ALB_ROLE_ARN" \
   --wait --timeout 5m
 kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
+bash "$(dirname "$0")/agent/env/install-externaldns.sh"
 
 echo "== 4. Install/upgrade Argo CD =="
 helm upgrade --install argocd argo/argo-cd \

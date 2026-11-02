@@ -9,6 +9,8 @@
 #   2. Pauses Argo CD auto-sync for the app (otherwise it would re-create the Ingress seconds after we delete it).
 #   3. Deletes the Ingress objects, so the controller removes the ALB and its security groups.
 #   4. Waits until AWS shows none of them left.
+#   5. Waits (up to DNS_WAIT_SECONDS) for ExternalDNS to remove the bako.awsbako.site records from Route 53. Those are free,
+#      so a leftover is only a warning: the next Start reuses them.
 # Exit codes: 0 = nothing left (safe to destroy)   1 = something is still there (do NOT destroy)   2 = could not ask AWS
 #
 # Settings come from the environment, with these defaults:
@@ -19,6 +21,8 @@ REGION="${REGION:-eu-north-1}"
 APP_NAMESPACE="${APP_NAMESPACE:-bako}"          # namespace that holds the Ingress
 ARGO_NAMESPACE="${ARGO_NAMESPACE:-argocd}"
 ARGO_APP="${ARGO_APP:-bako}"                    # the Argo CD Application to pause
+DOMAIN="${DOMAIN:-bako.awsbako.site}"
+DNS_WAIT_SECONDS="${DNS_WAIT_SECONDS:-120}"
 WAIT_SECONDS="${WAIT_SECONDS:-300}"
 POLL_SECONDS="${POLL_SECONDS:-10}"
 
@@ -41,6 +45,33 @@ leftovers() {
   a=$(list_albs) || return 2
   s=$(list_sgs) || return 2
   echo "${a} ${s}" | xargs
+}
+
+# Records ExternalDNS made for the domain (A/AAAA/TXT at the domain name; the certificate CNAME and NS/SOA are not touched).
+dns_records() {
+  local zone
+  zone=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" --max-items 1 \
+    --query "HostedZones[?Name=='${DOMAIN}.'].Id | [0]" --output text 2>/dev/null) || return 2
+  [ -z "$zone" ] || [ "$zone" = "None" ] && return 0
+  aws route53 list-resource-record-sets --hosted-zone-id "$zone" \
+    --query "ResourceRecordSets[?(Type=='A' || Type=='AAAA' || Type=='TXT') && contains(Name, '${DOMAIN}')].[Type,Name]" \
+    --output text 2>/dev/null | xargs
+}
+
+# Never blocks the destroy: a leftover record costs nothing and the next Start takes it over (same owner id).
+wait_for_dns() {
+  local w=0 left
+  echo "== Waiting up to ${DNS_WAIT_SECONDS}s for ExternalDNS to remove the DNS records of ${DOMAIN} =="
+  while true; do
+    left=$(dns_records) || { echo "(could not read Route 53; skipping the DNS check)"; return 0; }
+    if [ -z "$left" ]; then echo "DNS records removed."; return 0; fi
+    if [ "$w" -ge "$DNS_WAIT_SECONDS" ]; then
+      echo "WARNING: DNS records still present: $left"
+      echo "         They are free and the next Start reuses them. Continuing."
+      return 0
+    fi
+    sleep "$POLL_SECONDS"; w=$((w + POLL_SECONDS))
+  done
 }
 
 echo "== Checking AWS for load balancers of cluster ${CLUSTER_NAME} in ${REGION} =="
@@ -78,7 +109,9 @@ while true; do
     exit 2
   fi
   if [ -z "$found" ]; then
-    echo "Done: the load balancer and its security groups are gone. Safe to destroy."
+    echo "The load balancer and its security groups are gone."
+    wait_for_dns
+    echo "Done. Safe to destroy."
     exit 0
   fi
   if [ "$waited" -ge "$WAIT_SECONDS" ]; then
