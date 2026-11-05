@@ -276,7 +276,7 @@ def get_pods():
 STAGE_LABELS = {"apply": "Terraform apply finished", "boot": "Cluster set up (bootstrap)", "trig": "Build requested on GitHub",
                 "build": "Images built", "push": "Images pushed to ECR", "bot": "Bot pull request opened",
                 "merge": "Pull request merged", "argo": "Argo CD synced", "ready": "READY checks all pass",
-                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked", "dns": "DNS name checked"}
+                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked", "dns": "DNS name checked", "sli": "Request numbers saved"}
 
 def todays_events():
     events = []
@@ -405,6 +405,67 @@ def reports_page():
     st.caption("Gap = AWS actual minus estimate (a positive gap means AWS charged more than the hours predict). "
                "Today's AWS number is partial: AWS fills it in up to a day later.")
     questions_section()
+
+def slo_tab():
+    ## Request numbers from the load balancer logs (see sli.py). Counts and timings only. Measure-only: no target, no budget yet.
+    import sli
+    import pandas as pd
+    store = sli.Store(AWS, REGION, PROFILE, read_setting("EXPECTED_ACCOUNT", "483272865934"), env=UENV)
+    if "slo_days" not in ss:                              # read the small daily files once, then only on Refresh
+        ss.slo_days, ss.slo_msg = store.read_all_daily() if AWS else ([], "The AWS command line was not found on this computer.")
+    top1, top2 = st.columns([1, 5])
+    with top1:
+        if st.button("Refresh", key="slo_refresh", use_container_width=True,
+                     help="Reads today's load balancer logs and any missing day from S3 and saves the numbers. Logs arrive about 5 minutes late."):
+            with st.spinner("Reading the load balancer logs from S3..."):
+                ok, msgs = sli.rollup_missing(store, include_today=True) if AWS else (False, ["The AWS command line was not found."])
+                ss.slo_days, err = store.read_all_daily()
+                ss.slo_msg = err or ("; ".join(msgs[-2:]))
+            st.rerun()
+    with top2:
+        st.caption(ss.get("slo_msg") or "Days are UTC days (Cairo is 2 hours ahead). Only counts and timings are saved, never what you typed.")
+    days = [d for d in ss.slo_days if d.get("total", 0) > 0]
+    if not days:
+        st.markdown("<div class='card'><div class='ctitle'>No request numbers yet</div>"
+                    "<div class='sub'>Turn on the load balancer access logs (one line in K8s/ingress.yaml), start the lab, use the app for a few minutes, "
+                    "wait about 10 minutes, then press Refresh.</div></div>", unsafe_allow_html=True)
+        return
+    w = sli.window_summary(days, 30)
+    last = days[0]
+    kpis = [("Counted requests", f"{w['total']:,}", f"last 30 days · {w['days']} days with traffic"),
+            ("Success rate", f"{w['rate']:.2f}%", "measuring, no target yet"),
+            ("Failed or slow", f"{w['bad']:,}", f"a 5xx, or over {sli.SLOW_MS} ms"),
+            ("Slowest day, p95", f"{w['p95_ms_worst_day']} ms" if w["p95_ms_worst_day"] is not None else "-", "95 in 100 requests were faster")]
+    for col, (l, v, n) in zip(st.columns(4, gap="small"), kpis):
+        col.markdown(f"<div class='kpi'><div class='l'>{html.escape(l)}</div><div class='v'>{html.escape(str(v))}</div>"
+                     f"<div class='n'>{html.escape(n)}</div></div>", unsafe_allow_html=True)
+    st.write("")
+    ordered = list(reversed(days[:30]))
+    df = pd.DataFrame({"Good": [d["good"] for d in ordered], "Slow": [d["slow"] for d in ordered],
+                       "5xx errors": [d["status_5xx"] for d in ordered]}, index=[d["day"][5:] for d in ordered])
+    st.markdown("<div class='ctitle'>Requests per day</div>", unsafe_allow_html=True)
+    st.bar_chart(df, color=[T["muted"], T["ink"], T["badFg"]], height=220, stack=True)
+    head = ("<tr><th>Day (UTC)</th><th class='n'>Requests</th><th class='n'>Failed or slow</th><th class='n'>5xx</th>"
+            "<th class='n'>p50 ms</th><th class='n'>p95 ms</th><th>First to last</th><th class='n'>Not counted</th></tr>")
+    body = ""
+    for d in days[:14]:
+        bad_style = f" style='color:{T['badFg']}'" if d["bad"] else ""
+        span = f"{str(d['first'])[:5]} to {str(d['last'])[:5]}"
+        body += (f"<tr style='white-space:nowrap'><td>{html.escape(d['day'])}{' (so far)' if d['day'] == datetime.now(timezone.utc).date().isoformat() else ''}</td>"
+                 f"<td class='n'>{d['total']}</td><td class='n'{bad_style}>{d['bad']}</td><td class='n'>{d['status_5xx']}</td>"
+                 f"<td class='n'>{d['p50_ms'] if d['p50_ms'] is not None else '-'}</td>"
+                 f"<td class='n'>{d['p95_ms'] if d['p95_ms'] is not None else '-'}</td>"
+                 f"<td>{html.escape(span)}</td><td class='n'>{d.get('noise', 0)}</td></tr>")
+    st.markdown(f"<div class='card'><table class='rtable'>{head}{body}</table></div>", unsafe_allow_html=True)
+    st.caption("Counted = reached a pod, or the load balancer failed it. Not counted = redirects from port 80 and bot hits the load balancer answers itself. "
+               "4xx answers count as good. The target and the error budget come after about two weeks of real numbers.")
+    if last.get("bad_requests"):
+        head = "<tr><th>Time (UTC)</th><th class='n'>Status</th><th>Area</th><th class='n'>Took</th></tr>"
+        body = "".join(f"<tr><td>{html.escape(b['time'])}</td><td class='n'>{b['status']}</td><td>{html.escape(b['area'])}</td>"
+                       f"<td class='n'>{str(b['ms']) + ' ms' if b['ms'] is not None else '-'}</td></tr>" for b in last["bad_requests"][:15])
+        st.markdown(f"<div class='ctitle' style='margin-top:10px'>Counted against you on {html.escape(last['day'])}</div>"
+                    f"<div class='card'><table class='rtable'>{head}{body}</table></div>", unsafe_allow_html=True)
+        st.caption("Only time, status, area and duration are kept.")
 
 def cents(x):
     return f"${x:.4f}" if x < 0.1 else f"${x:.2f}"
@@ -984,8 +1045,8 @@ with main:
         code_pr_card()
 
     ## --- tabs ---
-    t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs([":material/science: Lab", ":material/account_tree: Flow", ":material/cloud: AWS",
-                                                         ":material/hub: Cluster", ":material/folder: Repo"])
+    t_lab, t_flow, t_slo, t_infra, t_cluster, t_repo = st.tabs([":material/science: Lab", ":material/account_tree: Flow", ":material/speed: SLO",
+                                                                ":material/cloud: AWS", ":material/hub: Cluster", ":material/folder: Repo"])
     def page_note(text):
         st.markdown(f"<div class='pagenote'><span class='i'>i</span><span><b>On this page:</b> {html.escape(text)}</span></div>",
                     unsafe_allow_html=True)
@@ -1047,6 +1108,9 @@ with main:
         flow_tab.show(REPO, running=running, on_ask=ask_bako, theme=ss.theme, chat_trace=ss.get("chat_trace"),
                       on_rerun=rerun_from)
 
+    with t_slo:
+        page_note("how many requests the app answered, how many failed or were slow, and how fast. Numbers come from the load balancer logs in S3, so they stay here while the lab is off.")
+        slo_tab()
     with t_infra:
         page_note("what AWS is running for the lab, and whether anything is still billing.")
         tabs.aws_tab(dict(repo=REPO, env=UENV, bash=BASH, T=T, hourly=HOURLY, up_now=up_now))

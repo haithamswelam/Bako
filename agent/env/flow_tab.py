@@ -79,6 +79,8 @@ FLOWS = {
               "Fewer rows than were saved means the restore is not what you expect. Do not use the lab until you know why. Skipped if the count could not run."),
             N("dns", "DNS name check", "bako.awsbako.site", "ExternalDNS is running and has written the name into Route 53, pointing at the load balancer that exists now.",
               "Pod not running or no record after 6 minutes. The lab is still up: use the load balancer address (kubectl get ingress bako -n bako) and read kubectl -n kube-system logs deployment/external-dns."),
+            N("sli", "Request numbers", "yesterday saved", "Reads the load balancer logs in S3 for every finished day of the last week and saves one small file per day: counts and timings only, never what you typed or any expense.",
+              "Skipped, never red: the lab is not affected. Check that access logs are on in K8s/ingress.yaml and that the AWS login can read the bako-ops bucket, then press Refresh on the SLO tab."),
             N("ready", "READY checks", "checks.sh ready", "Argo Healthy, pods Running with 0 restarts, running image tags exist in ECR.",
               "The failing row names the problem. Fix it, then run the checks again.")])]),
     "stop": dict(title="Stop Lab flow", lanes=[
@@ -460,7 +462,7 @@ def evidence_for(node, s, repo, view):
             extra = f"\n--- end of {os.path.basename(log)} ---\n" + tail(log, 900)
     return (text or "(no detail recorded)") + extra
 
-RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "dbchk", "dns", "ready"}   # steps after terraform apply
+RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "dbchk", "dns", "sli", "ready"}   # steps after terraform apply
 
 def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None):
     t = THEMES.get(theme, THEMES["warm"])

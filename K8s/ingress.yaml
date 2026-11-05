@@ -29,6 +29,8 @@ metadata:
     alb.ingress.kubernetes.io/success-codes: "200"
     # Pods that are being replaced stop receiving traffic after 30 s instead of the default 300 s
     alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+    # Monitoring: the ALB writes one line per request to our permanent bucket (every ~5 min). The logs outlive the nightly destroy.
+    alb.ingress.kubernetes.io/load-balancer-attributes: access_logs.s3.enabled=true,access_logs.s3.bucket=bako-ops-483272865934-eu-north-1,access_logs.s3.prefix=alb-logs
     # Tags on the AWS resources, to find them in the console and in the bill
     alb.ingress.kubernetes.io/tags: Project=bako,Environment=lab
 spec:
