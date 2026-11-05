@@ -9,8 +9,8 @@
 #   2. Pauses Argo CD auto-sync for the app (otherwise it would re-create the Ingress seconds after we delete it).
 #   3. Deletes the Ingress objects, so the controller removes the ALB and its security groups.
 #   4. Waits until AWS shows none of them left.
-#   5. Waits (up to DNS_WAIT_SECONDS) for ExternalDNS to remove the bako.awsbako.site records from Route 53. Those are free,
-#      so a leftover is only a warning: the next Start reuses them.
+#   5. Waits (up to DNS_WAIT_SECONDS) for ExternalDNS to remove the bako.awsbako.site records from Route 53. If it does not, they are
+#      deleted by hand here (never blocks the destroy).
 # Exit codes: 0 = nothing left (safe to destroy)   1 = something is still there (do NOT destroy)   2 = could not ask AWS
 #
 # Settings come from the environment, with these defaults:
@@ -47,6 +47,23 @@ leftovers() {
   echo "${a} ${s}" | xargs
 }
 
+# Deletes the records ExternalDNS made: A/AAAA at the domain name, and its TXT markers (names starting externaldns-).
+# NS, SOA, the certificate CNAME and any other TXT record are never touched.
+purge_dns_records() {
+  local zone batch
+  zone=$(aws route53 list-hosted-zones-by-name --dns-name "$DOMAIN" --max-items 1 \
+    --query "HostedZones[?Name=='${DOMAIN}.'].Id | [0]" --output text 2>/dev/null) || return 0
+  { [ -z "$zone" ] || [ "$zone" = "None" ]; } && return 0
+  zone="${zone##*/}"
+  batch=$(aws route53 list-resource-record-sets --hosted-zone-id "$zone" \
+    --query "{Changes: ResourceRecordSets[?(Name=='${DOMAIN}.' && (Type=='A' || Type=='AAAA')) || (Type=='TXT' && starts_with(Name, 'externaldns-'))].{Action: 'DELETE', ResourceRecordSet: @}}" \
+    --output json 2>/dev/null) || return 0
+  case "$batch" in *'"Action"'*) ;; *) return 0 ;; esac
+  echo "Removing the leftover DNS records of ${DOMAIN} by hand:"
+  aws route53 change-resource-record-sets --hosted-zone-id "$zone" --change-batch "$batch" \
+    --query "ChangeInfo.Status" --output text || echo "(could not remove them; remove them in the Route 53 console)"
+}
+
 # Records ExternalDNS made for the domain (A/AAAA/TXT at the domain name; the certificate CNAME and NS/SOA are not touched).
 dns_records() {
   local zone
@@ -66,8 +83,12 @@ wait_for_dns() {
     left=$(dns_records) || { echo "(could not read Route 53; skipping the DNS check)"; return 0; }
     if [ -z "$left" ]; then echo "DNS records removed."; return 0; fi
     if [ "$w" -ge "$DNS_WAIT_SECONDS" ]; then
-      echo "WARNING: DNS records still present: $left"
-      echo "         They are free and the next Start reuses them. Continuing."
+      echo "WARNING: ExternalDNS did not remove these DNS records in ${DNS_WAIT_SECONDS}s: $left"
+      echo "ExternalDNS log (last lines):"
+      kubectl -n kube-system logs deployment/external-dns --tail=15 2>&1 | sed 's/^/    /' || true
+      purge_dns_records
+      left=$(dns_records) || left=""
+      if [ -z "$left" ]; then echo "DNS records removed by hand."; else echo "WARNING: still present: $left (remove them in the Route 53 console before the next Start)"; fi
       return 0
     fi
     sleep "$POLL_SECONDS"; w=$((w + POLL_SECONDS))

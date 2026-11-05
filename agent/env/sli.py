@@ -1,0 +1,302 @@
+"""Request numbers for Bako (measure-only version).
+
+The load balancer (ALB) writes one log line per request into the permanent S3 bucket.
+This file turns one UTC day of those lines into one small JSON file:
+
+    s3://<bucket>/sli-daily/YYYY-MM-DD.json
+
+The file holds COUNTS AND TIMINGS ONLY: how many requests, how many failed or were slow, the 95th percentile time,
+and for each failed or slow request: the time, the status, the area (/api or the site) and how long it took.
+Never the address with its query string, never a request body, never an IP address, never anything about expenses.
+
+A "counted" request is one the app really answered or should have answered: it reached a pod, or the load balancer
+itself failed it with a 5xx. Redirects from port 80 and bot hits that the load balancer answers on its own (404)
+are not counted, because they say nothing about the app and would make the numbers look better than they are.
+
+  good  = status below 500 and answered in under SLOW_MS
+  bad   = a 5xx, or slower than SLOW_MS (4xx are good: a typo or a bot is not the app's fault)
+
+Days are UTC days, because that is how the load balancer names its log folders (Cairo is 2 hours ahead).
+There is no target and no budget yet: the plan is to measure for about two weeks and then choose the SLO from real data.
+
+Run by hand:
+    python agent/env/sli.py rollup            # roll up every missing or unfinished day of the last 7
+    python agent/env/sli.py rollup 2026-11-05 # one day
+    python agent/env/sli.py selftest          # offline check of the parsing and the maths, no AWS needed
+"""
+import gzip, io, json, os, re, shutil, subprocess, sys, tempfile
+from datetime import datetime, timedelta, timezone
+
+SLOW_MS = 500
+KEEP_BAD = 50          # at most this many failed or slow requests are listed per day
+DAILY_PREFIX = "sli-daily"
+LOG_PREFIX = "alb-logs"
+TOKEN = re.compile(r'"[^"]*"|\S+')
+
+
+## ---------------------------------------------------------------
+## Reading one log line
+## ---------------------------------------------------------------
+def parse_line(line):
+    ## ALB access log: space separated, some fields in quotes. Field order is fixed by AWS:
+    ## 0 type, 1 time, 2 elb, 3 client, 4 target, 5 request_time, 6 target_time, 7 response_time,
+    ## 8 elb_status, 9 target_status, 10 received, 11 sent, 12 "request", ...
+    ## Returns None for a line that does not look like one. Never raises.
+    f = TOKEN.findall(line)
+    if len(f) < 13:
+        return None
+    try:
+        status = int(f[8])
+        times = [float(f[5]), float(f[6]), float(f[7])]
+    except ValueError:
+        return None
+    req = f[12].strip('"').split(" ")
+    url = req[1] if len(req) > 1 else ""
+    path = re.sub(r"^[a-z]+://[^/]*", "", url).split("?")[0]          # no host, no query string
+    total_ms = None if any(t < 0 for t in times) else round(sum(times) * 1000)
+    return {"time": f[1], "status": status, "target": f[4], "total_ms": total_ms,
+            "area": "api" if path == "/api" or path.startswith("/api/") else "site"}
+
+def counted(r):
+    ## reached a pod, or the load balancer itself failed it
+    return r["target"] != "-" or r["status"] >= 500
+
+def is_bad(r):
+    return r["status"] >= 500 or (r["total_ms"] is not None and r["total_ms"] >= SLOW_MS)
+
+def percentile(sorted_values, p):
+    if not sorted_values:
+        return None
+    k = max(0, min(len(sorted_values) - 1, int(round(p / 100.0 * len(sorted_values) + 0.5)) - 1))
+    return sorted_values[k]
+
+def summarize_day(day, lines, files=0):
+    ## day: "YYYY-MM-DD"; lines: iterable of raw log lines. Pure function, no AWS.
+    total = noise = good = slow = e5 = unreadable = 0
+    classes = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
+    areas = {"api": 0, "site": 0}
+    times, bad, first, last = [], [], None, None
+    for line in lines:
+        if not line.strip():
+            continue
+        r = parse_line(line)
+        if r is None:
+            unreadable += 1
+            continue
+        if not counted(r):
+            noise += 1
+            continue
+        total += 1
+        classes[f"{r['status'] // 100}xx"] = classes.get(f"{r['status'] // 100}xx", 0) + 1
+        areas[r["area"]] += 1
+        first = r["time"] if first is None or r["time"] < first else first
+        last = r["time"] if last is None or r["time"] > last else last
+        if r["total_ms"] is not None:
+            times.append(r["total_ms"])
+        if r["status"] >= 500:
+            e5 += 1
+        elif is_bad(r):
+            slow += 1
+        if is_bad(r):
+            if len(bad) < KEEP_BAD:
+                bad.append({"time": r["time"][11:19], "status": r["status"], "area": r["area"], "ms": r["total_ms"]})
+        else:
+            good += 1
+    times.sort()
+    return {"day": day, "total": total, "good": good, "bad": total - good, "status_5xx": e5, "slow": slow,
+            "classes": classes, "areas": areas, "noise": noise, "unreadable": unreadable,
+            "p50_ms": percentile(times, 50), "p95_ms": percentile(times, 95), "max_ms": times[-1] if times else None,
+            "first": first[11:19] if first else None, "last": last[11:19] if last else None,
+            "bad_requests": bad, "log_files": files, "slow_ms": SLOW_MS}
+
+def window_summary(days, n=30):
+    ## days: list of daily dicts (any order). Totals over the newest n days that have data.
+    days = sorted(days, key=lambda d: d["day"], reverse=True)[:n]
+    total = sum(d["total"] for d in days)
+    bad = sum(d["bad"] for d in days)
+    p95s = [d["p95_ms"] for d in days if d.get("p95_ms") is not None]
+    return {"days": len(days), "total": total, "bad": bad, "good": total - bad,
+            "rate": (100.0 * (total - bad) / total) if total else None,
+            "p95_ms_worst_day": max(p95s) if p95s else None,
+            "noise": sum(d.get("noise", 0) for d in days)}
+
+
+## ---------------------------------------------------------------
+## S3 (through the AWS CLI, like the snapshots: no extra Python packages)
+## ---------------------------------------------------------------
+class Store:
+    def __init__(self, aws, region, profile="", account="", env=None, bucket=""):
+        self.aws, self.region, self.profile, self.env = aws, region, profile, env
+        self.account = account
+        self.bucket = bucket or os.environ.get("BAKO_OPS_BUCKET") or f"bako-ops-{account}-{region}"
+
+    def _cmd(self, *args):
+        cmd = [self.aws, *args, "--region", self.region]
+        if self.profile and not os.environ.get("AWS_PROFILE"):
+            cmd += ["--profile", self.profile]
+        return cmd
+
+    def run(self, *args, timeout=180, stdin=None):
+        try:
+            p = subprocess.run(self._cmd(*args), capture_output=True, text=True, timeout=timeout,
+                               input=stdin, stdin=None if stdin is not None else subprocess.DEVNULL, env=self.env)
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        except subprocess.TimeoutExpired:
+            return 124, "timed out"
+        except OSError as e:
+            return 127, str(e)
+
+    def log_prefix(self, day):
+        y, m, d = day.split("-")
+        return f"s3://{self.bucket}/{LOG_PREFIX}/AWSLogs/{self.account}/elasticloadbalancing/{self.region}/{y}/{m}/{d}/"
+
+    def read_day_logs(self, day):
+        ## returns (lines, number of files) or (None, message) when S3 cannot be read
+        tmp = tempfile.mkdtemp(prefix="bako-alb-")
+        try:
+            rc, out = self.run("s3", "sync", self.log_prefix(day), tmp, "--only-show-errors")
+            if rc != 0:
+                return None, out.strip()[-300:]
+            lines, files = [], 0
+            for name in sorted(os.listdir(tmp)):
+                if not name.endswith(".log.gz"):
+                    continue
+                files += 1
+                with gzip.open(os.path.join(tmp, name), "rt", encoding="utf-8", errors="replace") as fh:
+                    lines.extend(fh.read().splitlines())
+            return lines, files
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def write_daily(self, summary):
+        key = f"s3://{self.bucket}/{DAILY_PREFIX}/{summary['day']}.json"
+        rc, out = self.run("s3", "cp", "-", key, "--only-show-errors", "--sse", "AES256",
+                           stdin=json.dumps(summary, separators=(",", ":")))
+        return rc == 0, out.strip()[-300:]
+
+    def read_all_daily(self):
+        ## every daily file, newest first. Returns (list, message). An empty list is normal before the first run.
+        tmp = tempfile.mkdtemp(prefix="bako-sli-")
+        try:
+            rc, out = self.run("s3", "sync", f"s3://{self.bucket}/{DAILY_PREFIX}/", tmp, "--only-show-errors")
+            if rc != 0:
+                return [], "Could not read the saved numbers from S3: " + out.strip()[-200:]
+            days = []
+            for name in os.listdir(tmp):
+                if name.endswith(".json"):
+                    try:
+                        with open(os.path.join(tmp, name), encoding="utf-8") as fh:
+                            days.append(json.load(fh))
+                    except (OSError, ValueError):
+                        pass
+            return sorted(days, key=lambda d: d["day"], reverse=True), ""
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+## ---------------------------------------------------------------
+## Roll-up: which days, and doing them
+## ---------------------------------------------------------------
+def utc_today():
+    return datetime.now(timezone.utc).date()
+
+def candidate_days(existing, back=7, include_today=False, now=None):
+    ## Days to (re)compute: missing, or rolled up before the day was safely over (logs arrive ~5 minutes late).
+    now = now or datetime.now(timezone.utc)
+    have = {d["day"]: d for d in existing}
+    out = []
+    for i in range(0 if include_today else 1, back + 1):
+        day = (now.date() - timedelta(days=i)).isoformat()
+        cur = have.get(day)
+        day_end = datetime.fromisoformat(day).replace(tzinfo=timezone.utc) + timedelta(days=1)
+        if cur is None or cur.get("rolled_at", "") < (day_end + timedelta(minutes=30)).isoformat():
+            out.append(day)
+    return out
+
+def rollup_day(store, day):
+    ## Returns (summary or None, message). A day with no log files is saved as an empty day only if it is already over.
+    lines, info = store.read_day_logs(day)
+    if lines is None:
+        return None, f"{day}: could not read the logs ({info})"
+    summary = summarize_day(day, lines, files=info)
+    summary["rolled_at"] = datetime.now(timezone.utc).isoformat()
+    ok, msg = store.write_daily(summary)
+    if not ok:
+        return None, f"{day}: could not save the numbers ({msg})"
+    return summary, f"{day}: {summary['total']} counted requests, {summary['bad']} failed or slow ({info} log files)"
+
+def rollup_missing(store, back=7, include_today=False):
+    ## Used by START and by the dashboard button. Never raises. Returns (ok, lines of text).
+    existing, err = store.read_all_daily()
+    if err and not existing:
+        return False, [err]
+    out, ok = [], True
+    for day in candidate_days(existing, back, include_today):
+        s, msg = rollup_day(store, day)
+        out.append(msg)
+        ok = ok and s is not None
+    return ok, out or ["Nothing to do: every day of the last week is already saved."]
+
+
+## ---------------------------------------------------------------
+## Offline check: python agent/env/sli.py selftest
+## ---------------------------------------------------------------
+def _line(time, status, target, ms, path="/api/goals", tstatus=None):
+    t = ms / 1000.0
+    tgt = "10.0.1.5:8000" if target else "-"
+    ts = (tstatus if tstatus is not None else status) if target else "-"
+    treq = "0.000" if target else "-1"
+    return (f'https {time} app/k8s-bako/abc 203.0.113.9:5555 {tgt} {treq if target else "-1"} {t:.3f} 0.000 {status} {ts} 100 200 '
+            f'"GET https://bako.awsbako.site:443{path} HTTP/1.1" "UA/1.0" ECDHE-RSA TLSv1.3 arn:tg "Root=1-x" "bako.awsbako.site" '
+            f'"arn:cert" 0 {time} "forward" "-" "-" "{tgt}" "{ts}" "-" "-"')
+
+def selftest():
+    D = "2026-11-05"
+    lines = [
+        _line(f"{D}T10:00:01.000000Z", 200, True, 40),                          # good
+        _line(f"{D}T10:00:02.000000Z", 200, True, 45, "/"),                      # good, site
+        _line(f"{D}T10:00:03.000000Z", 404, True, 30, "/api/nope"),              # 4xx is good
+        _line(f"{D}T10:00:04.000000Z", 200, True, 900),                          # slow
+        _line(f"{D}T10:00:05.000000Z", 502, False, 0),                           # ALB 5xx, no target: counted, bad
+        _line(f"{D}T10:00:06.000000Z", 301, False, 0, "/"),                      # redirect: noise
+        _line(f"{D}T10:00:07.000000Z", 404, False, 0, "/wp-login.php"),          # bot: noise
+        "not a log line",
+        _line(f"{D}T10:00:08.000000Z", 200, True, 60, "/api/x?token=SECRET"),     # query string must not be kept
+    ]
+    s = summarize_day(D, lines)
+    assert s["total"] == 6, s
+    assert s["good"] == 4 and s["bad"] == 2, s
+    assert s["status_5xx"] == 1 and s["slow"] == 1, s
+    assert s["noise"] == 2 and s["unreadable"] == 1, s
+    assert s["classes"]["4xx"] == 1 and s["classes"]["5xx"] == 1, s
+    assert s["areas"] == {"api": 5, "site": 1}, s
+    assert s["first"] == "10:00:01" and s["last"] == "10:00:08", s
+    assert "SECRET" not in json.dumps(s) and "203.0.113.9" not in json.dumps(s), "private data leaked"
+    assert [b["status"] for b in s["bad_requests"]] == [200, 502], s["bad_requests"]
+    w = window_summary([s, dict(s, day="2026-11-04", total=4, bad=0, good=4, p95_ms=50)])
+    assert w["total"] == 10 and w["bad"] == 2 and abs(w["rate"] - 80.0) < 1e-9, w
+    now = datetime(2026, 11, 6, 9, 0, tzinfo=timezone.utc)
+    done = {"day": "2026-11-05", "rolled_at": "2026-11-06T08:00:00+00:00"}
+    early = {"day": "2026-11-04", "rolled_at": "2026-11-04T23:50:00+00:00"}       # rolled before the day was over
+    c = candidate_days([done, early], back=3, now=now)
+    assert "2026-11-05" not in c and "2026-11-04" in c and "2026-11-03" in c, c
+    print("sli selftest: all checks passed")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        selftest()
+        raise SystemExit(0)
+    aws = shutil.which("aws")
+    if not aws:
+        raise SystemExit("aws CLI not found")
+    region = os.environ.get("AWS_REGION", "eu-north-1")
+    account = os.environ.get("BAKO_ACCOUNT", "483272865934")
+    st = Store(aws, region, os.environ.get("BAKO_PROFILE", "bakolab"), account)
+    if len(sys.argv) > 2 and sys.argv[1] == "rollup":
+        s, msg = rollup_day(st, sys.argv[2])
+        print(msg)
+        raise SystemExit(0 if s else 1)
+    ok, msgs = rollup_missing(st)
+    print("\n".join(msgs))
+    raise SystemExit(0 if ok else 1)

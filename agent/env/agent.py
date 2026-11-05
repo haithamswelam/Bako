@@ -6,6 +6,7 @@ import json, os, shutil, subprocess, sys, time
 from openai import OpenAI
 import keyring
 import redact                         # hides secrets before they reach the trace or the model
+import sli                            # request numbers from the load balancer logs (counts and timings only)
 MODEL = os.environ.get("AGENT_MODEL", "gpt-5.4-nano")
 API_KEY = os.environ.get("OPENAI_API_KEY") or keyring.get_password("bako-agent", "OPENAI_API_KEY")
 if not API_KEY:
@@ -36,7 +37,7 @@ UNIX_ENV = shellenv.unix_env(BASH, {k: v for k, v in os.environ.items() if k != 
 
 ## "start --from <step>" re-runs START from one step after terraform apply (the lab must already exist).
 ORDER = ["boot", "trig", "bot", "merge", "argo", "ready"]
-ALIAS = {"test": "trig", "build": "trig", "push": "trig", "dbchk": "argo"}
+ALIAS = {"test": "trig", "build": "trig", "push": "trig", "dbchk": "argo", "dns": "argo", "sli": "argo"}
 FROM = ""
 if "--from" in sys.argv:
     i = sys.argv.index("--from")
@@ -279,6 +280,7 @@ def tool_terraform_destroy():
         return ("REFUSED: the load balancer is not released, so destroying the cluster now would leave it running and billing. "
                 "Nothing was destroyed.\n" + note)
     print("Load balancer released.")
+    print("\n".join(note.splitlines()[-8:]))      # the last lines of pre-destroy-alb.sh (ALB gone, DNS records removed)
     log_path = f"agent/env/reports/destroy-{time.strftime('%Y%m%d-%H%M%S')}.log"
     print(f"Destroy started. It takes about 10-15 minutes. Watch it with: tail -f {log_path}")
     try:
@@ -726,6 +728,8 @@ def preflight_start():
         problems.append("bootstrap-cluster.sh was not found in the repo root")
     if not os.path.exists(".github/workflows/ci.yml"):
         problems.append(".github/workflows/ci.yml was not found")
+    if not os.path.exists("agent/env/sli.py"):
+        problems.append("agent/env/sli.py was not found (the request numbers step is not installed)")
     if not os.path.exists("agent/env/install-externaldns.sh"):
         problems.append("agent/env/install-externaldns.sh was not found (HTTPS step 2 is not installed)")
     ## HTTPS: the Ingress must hold a real certificate ARN, not the placeholder word
@@ -1066,6 +1070,64 @@ def step_argo():
     stage("argo", "done", result)
     return True
 
+DNS_NAME = os.environ.get("BAKO_DOMAIN", "bako.awsbako.site")
+
+def step_dns_check():
+    ## START, after the database check: ExternalDNS must be running AND must have written DNS_NAME in Route 53,
+    ## pointing at the load balancer that exists NOW (a record left over from an earlier run would not match).
+    stage("dns", "running", "ExternalDNS pod and the DNS record for " + DNS_NAME)
+    seen = {"pod": "not checked", "rec": "not checked"}
+    def good():
+        rc, out = run_cmd([KUBECTL, "-n", "kube-system", "get", "pods", "-l", "app.kubernetes.io/name=external-dns",
+                           "-o", "jsonpath={range .items[*]}{.status.phase}/{.status.containerStatuses[0].ready} {end}"],
+                          30, CLEAN_ENV, stdout_only=True)
+        pod_ok = rc == 0 and "Running/true" in out
+        seen["pod"] = "running" if pod_ok else "not running yet"
+        rc, out = run_cmd([KUBECTL, "-n", "bako", "get", "ingress", "bako", "-o",
+                           "jsonpath={.status.loadBalancer.ingress[0].hostname}"], 30, CLEAN_ENV, stdout_only=True)
+        alb = out.strip().lower() if rc == 0 else ""
+        rc, out = run_cmd(aws_cmd("route53", "list-hosted-zones-by-name", "--dns-name", DNS_NAME, "--max-items", "1",
+                                  "--query", f"HostedZones[?Name=='{DNS_NAME}.'].Id | [0]", "--output", "text"),
+                          60, CLEAN_ENV, stdout_only=True)
+        zone = out.strip() if rc == 0 else ""
+        target = ""
+        if zone and zone != "None":
+            rc, out = run_cmd(aws_cmd("route53", "list-resource-record-sets", "--hosted-zone-id", zone, "--query",
+                                      f"ResourceRecordSets[?Name=='{DNS_NAME}.' && Type=='A'].AliasTarget.DNSName | [0]",
+                                      "--output", "text"), 60, CLEAN_ENV, stdout_only=True)
+            target = out.strip().lower() if rc == 0 else ""
+        if not alb:
+            seen["rec"] = "the load balancer address is not on the Ingress yet"
+        elif not target or target == "none":
+            seen["rec"] = "no record yet for " + DNS_NAME
+        elif alb in target:
+            seen["rec"] = "record points at the current load balancer"
+        else:
+            seen["rec"] = "the record points at an OLD load balancer (waiting for ExternalDNS to update it)"
+        return alb if (pod_ok and seen["rec"].startswith("record points")) else None
+    alb = wait_for(good, 6 * 60)
+    if not alb:
+        return fail("dns", f"ExternalDNS pod: {seen['pod']}. DNS record: {seen['rec']}. The lab itself is up and reachable by the load balancer "
+                           "address (kubectl get ingress bako -n bako). Look at: kubectl -n kube-system logs deployment/external-dns --tail=30")
+    stage("dns", "done", f"{DNS_NAME} -> {alb}. DNS can still take a minute or two to reach your phone.")
+    return True
+
+def step_sli():
+    ## START, after the DNS check: save the finished days' request numbers (yesterday and any day missing from the last 7)
+    ## from the load balancer logs in S3. Counts and timings only. A problem here NEVER stops the lab: it is shown and skipped.
+    stage("sli", "running", "saving the request numbers of finished days")
+    try:
+        ok, msgs = sli.rollup_missing(sli.Store(AWSCLI, REGION, PROFILE, EXPECTED_ACCOUNT, env=CLEAN_ENV))
+    except Exception as e:
+        ok, msgs = False, [f"unexpected problem: {e}"]
+    for m in msgs:
+        print("  " + m)
+    if ok:
+        stage("sli", "done", "; ".join(msgs[:3]))
+    else:
+        stage("sli", "skipped", "could not save the numbers, the lab is not affected. " + "; ".join(msgs[:2]))
+    return True
+
 def step_ready():
     stage("ready", "running", "running the READY checks")
     out = {"text": ""}
@@ -1132,7 +1194,7 @@ def run_tail(first):
     ## Everything after terraform apply. first = position in ORDER to begin at (0 = from the bootstrap).
     ## Steps before it are shown as skipped ("done in an earlier run").
     boxes = {"boot": ["boot"], "trig": ["trig", "test", "build", "push"], "bot": ["bot"],
-             "merge": ["merge"], "argo": ["argo", "dbchk"], "ready": ["ready"]}
+             "merge": ["merge"], "argo": ["argo", "dbchk", "dns", "sli"], "ready": ["ready"]}
     for key in ORDER[:first]:
         for sid in boxes[key]:
             stage(sid, "skipped", "done in an earlier run")
@@ -1171,6 +1233,9 @@ def run_tail(first):
             return
         if not step_db_check():
             return
+        if not step_dns_check():
+            return
+        step_sli()
     step_ready()
 
 if MODE == "stop":
