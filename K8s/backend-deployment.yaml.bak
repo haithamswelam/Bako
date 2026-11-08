@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bako-backend
+  namespace: bako
+  labels:
+    app: bako-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bako-backend
+  template:
+    metadata:
+      labels:
+        app: bako-backend
+    spec:
+      containers:
+        - name: bako-backend
+          image: 483272865934.dkr.ecr.eu-north-1.amazonaws.com/bako-backend:923a38ed5f11d095d8263c7831167fc0f13dd925
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DB_HOST
+              value: "bako-db.c16ocgiqooad.eu-north-1.rds.amazonaws.com"
+            - name: POSTGRES_PORT
+              value: "5432"
+            - name: POSTGRES_DB
+              value: "bako"
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: bako-db-credentials
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: bako-db-credentials
+                  key: password
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: bako-backend-service
+  namespace: bako
+spec:
+  selector:
+    app: bako-backend
+  ports:
+    - port: 8000
+      targetPort: 8000

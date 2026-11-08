@@ -93,6 +93,8 @@ FLOWS = {
               "Any other word means no. Nothing is deleted."),
         ]),
         dict(label="On your computer · save, destroy, verify", then="", nodes=[
+            N("obs", "Save app facts", "backend + database", "Before the snapshot, reads the backend pods and the database (read-only: sizes, counts, structure, log shapes) and saves one small file for today to S3, so the Observability tabs keep history after the nightly teardown.",
+              "Nothing is blocked: this step is skipped with a reason and the destroy goes on. History for today will be missing."),
             N("sdb", "Save database", "RDS snapshot", "Before anything is deleted, takes a snapshot of the database and waits until AWS says it is available. Keeps the newest 3. If it cannot be saved, the destroy is refused.",
               "The destroy is refused on purpose, nothing was deleted. The line says why: database busy, AWS error, or the snapshot did not finish in 40 minutes."),
             N("s4", "Terraform destroy", "deletes the lab", "Runs the exact saved destroy plan.",
@@ -119,13 +121,21 @@ FLOWS = {
             N("t3", "github", "runs, PRs, logs", "Reads CI runs, failed logs and pull requests through the gh program.", "The gh program has no GitHub login on this computer (gh auth login)."),
             N("t4", "read_file / search", "repo files only", "Reads files inside the repo. Secrets, state files, .env and .git are blocked in code.", "A blocked or missing path."),
             N("t5", "agent_logs", "newest run log", "Reads the newest agent log or trace file.", "No log yet today.")]),
+        dict(label="SRE tools · read only, used in SRE mode (Observability > Ask Bako)", then="the evidence pack comes first; these fill gaps", noarrows=True, nodes=[
+            N("s1", "endpoint_stats", "saved days", "Request numbers of one endpoint for the last days: requests, p50, p95, slow, failed.", "No saved day yet (the lab has not run a STOP or Refresh)."),
+            N("s2", "neighbours", "what else ran", "Other requests within a few minutes of a time on a saved day.", "That day has no per-request list."),
+            N("s3", "traces", "where time goes", "Reads request traces live: database, password check, outside calls, other code, and the slowest query shapes.", "Needs the lab up and the trace receiver (K8s/tracing.yaml)."),
+            N("s4", "pods", "live pods", "Reads the pods live: restarts, CPU and memory against limits, error shapes in the logs, warnings.", "Needs the lab up and kubectl pointed at bako-eks."),
+            N("s5", "database", "live, read only", "Reads database size, connections, biggest tables, dead rows (fixed read-only queries).", "Needs the lab up."),
+            N("s6", "find_code", "route handler", "Reads the function behind an endpoint such as POST /api/login.", "No FastAPI route decorator matches that endpoint.")]),
         dict(label="Proposals · need your typed word", then="", noarrows=True, nodes=[
             N("p1", "Propose start", "approved", "Bako can only suggest a START. The agent runs it after you type approved.", "Nothing runs without the typed word."),
             N("p2", "Propose stop", "destroy bako", "Bako can only suggest a STOP. The agent runs it after you type destroy bako.", "Nothing runs without the typed word."),
             N("p3", "Propose commit and push", "push bako", "Bako can suggest a commit and push to a new branch, never to main. It happens after you type push bako.", "Nothing runs without the typed word.")])]),
 }
 CHAT_TOOL_NODE = {"lab_check": "t1", "git": "t2", "github": "t3", "read_file": "t4", "list_dir": "t4", "search_repo": "t4",
-                  "agent_logs": "t5", "propose_start": "p1", "propose_stop": "p2", "propose_commit_push": "p3"}
+                  "agent_logs": "t5", "propose_start": "p1", "propose_stop": "p2", "propose_commit_push": "p3",
+                  "endpoint_stats": "s1", "neighbours": "s2", "traces": "s3", "pods": "s4", "database": "s5", "find_code": "s6"}
 
 STATUS_TEXT = {"done": "✓ Done", "running": "● Running", "failed": "✕ Failed", "waiting": "○ Waiting",
                "skipped": "– Skipped", "unused": "– Not used"}
@@ -197,13 +207,15 @@ def derive_stop(events, running):
         if ev == "step_result" and e.get("step") == "terraform_destroy":
             r = e.get("result", "")
             put("s4", "done" if r.startswith("destroy OK") else "failed", r[:300])
+        if ev == "stage" and e.get("id") == "obs":
+            put("obs", e.get("status", "waiting"), e.get("detail", ""))
         if ev == "stage" and e.get("id") == "sdb":
             put("sdb", e.get("status", "waiting"), e.get("detail", ""))
         if ev == "outcome" and "nothing_running" in e:
             put("s5", "done" if e.get("nothing_running") else "failed",
                 "NOTHING RUNNING" if e.get("nothing_running") else "something is still running or the destroy was not confirmed")
     finished = any(e.get("event") == "stop" for e in events)
-    order = ["s1", "s2", "s3", "sdb", "s4", "s5"]
+    order = ["s1", "s2", "s3", "obs", "sdb", "s4", "s5"]
     if running and not finished:
         for sid in order:
             if sid not in st:
@@ -256,7 +268,8 @@ def derive_chat(trace):
 ## Returns dict(what, fails, tele) where tele = [(title, text_or_object, language)]
 ## ---------------------------------------------------------------
 TOOL_BOX = {"t1": ("lab_check",), "t2": ("git",), "t3": ("github",), "t4": ("read_file", "list_dir", "search_repo"),
-            "t5": ("agent_logs",), "p1": ("propose_start",), "p2": ("propose_stop",), "p3": ("propose_commit_push",)}
+            "t5": ("agent_logs",), "s1": ("endpoint_stats",), "s2": ("neighbours",), "s3": ("traces",), "s4": ("pods",), "s5": ("database",),
+            "s6": ("find_code",), "p1": ("propose_start",), "p2": ("propose_stop",), "p3": ("propose_commit_push",)}
 
 def _j(obj):
     return json.dumps(obj, indent=2, ensure_ascii=False)
@@ -464,24 +477,28 @@ def evidence_for(node, s, repo, view):
 
 RERUNNABLE = {"boot", "trig", "test", "build", "push", "bot", "merge", "argo", "dbchk", "dns", "sli", "ready"}   # steps after terraform apply
 
-def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None):
+def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None, only=None):
     t = THEMES.get(theme, THEMES["warm"])
     ss = st.session_state
     ss.setdefault("flow_view", "start")
     ss.setdefault("flow_sel", {})
+    if only and ss.flow_view not in only:
+        ss.flow_view = only[0]                 # "only" limits which flows this call may show (Flow tab: start and stop; Bako and AI page: chat)
     view = ss.flow_view
     st.markdown(f"<style>{theme_css(t)}</style>", unsafe_allow_html=True)
 
     ## view switch
     with st.container(key="flowbox"):
         vcss = []
-        c1, c2, c3 = st.columns(3)
-        for col, vid, label in ((c1, "start", "Start Lab flow"), (c2, "stop", "Stop Lab flow"), (c3, "chat", "Bako and AI")):
-            if col.button(label, key=f"flowview_{vid}", use_container_width=True, type="primary" if view == vid else "secondary"):
-                ss.flow_view = vid
-                st.rerun(scope="fragment")
-            vcss.append(f".st-key-flowview_{vid} button{{background:{t['deep'] if view == vid else 'transparent'} !important;"
-                        f"border:2px solid {t['ink']} !important;}}.st-key-flowview_{vid} button p{{color:{t['light'] if view == vid else t['ink']} !important;}}")
+        choices = [(vid, label) for vid, label in (("start", "Start Lab flow"), ("stop", "Stop Lab flow"), ("chat", "Bako and AI"))
+                   if not only or vid in only]
+        if len(choices) > 1:
+            for col, (vid, label) in zip(st.columns(len(choices)), choices):
+                if col.button(label, key=f"flowview_{vid}", use_container_width=True, type="primary" if view == vid else "secondary"):
+                    ss.flow_view = vid
+                    st.rerun(scope="fragment")
+                vcss.append(f".st-key-flowview_{vid} button{{background:{t['deep'] if view == vid else 'transparent'} !important;"
+                            f"border:2px solid {t['ink']} !important;}}.st-key-flowview_{vid} button p{{color:{t['light'] if view == vid else t['ink']} !important;}}")
 
         st.markdown("<style>" + "".join(vcss) + "</style>", unsafe_allow_html=True)
 
@@ -594,6 +611,6 @@ def render_flow(repo, running=False, on_ask=None, theme="warm", chat_trace=None,
             st.caption("Every message is also saved, one line each, in agent/env/reports/chat-traces.jsonl. Passwords and keys are hidden in this record.")
 
 
-def show(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None):
+def show(repo, running=False, on_ask=None, theme="warm", chat_trace=None, on_rerun=None, only=None):
     ## Call this inside the Flow tab. It refreshes itself every 3 seconds while a run is active.
-    st.fragment(render_flow, run_every=3 if running else None)(repo, running, on_ask, theme, chat_trace, on_rerun)
+    st.fragment(render_flow, run_every=3 if running else None)(repo, running, on_ask, theme, chat_trace, on_rerun, only)

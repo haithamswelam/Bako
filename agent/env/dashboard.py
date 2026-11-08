@@ -19,6 +19,9 @@ import prmerge
 import usage
 import flow_tab
 import tabs
+import charts
+import obs
+import sre
 import importlib
 ## Streamlit keeps imported files in memory until the server restarts. Reloading the small helper files
 ## on every full page run means a copied-in new version is used straight away.
@@ -89,8 +92,35 @@ def save_theme(name):
             f.write(name)
     except OSError:
         pass
+UI_FILE = os.path.join(REPO, "agent", "env", "reports", "ui-state.json")
+def ui_get(key, default=None):
+    try:
+        with open(UI_FILE, encoding="utf-8") as f:
+            return json.load(f).get(key, default)
+    except (OSError, ValueError):
+        return default
+def ui_set(key, value):
+    try:
+        os.makedirs(os.path.dirname(UI_FILE), exist_ok=True)
+        try:
+            with open(UI_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data[key] = value
+        with open(UI_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
 if "theme" not in ss:
     ss.theme = load_theme()
+if "view" not in ss:
+    ss.view = ui_get("view", "Operator") if ui_get("view", "Operator") in ("Operator", "Observability", "Bako & AI") else "Operator"
+def sli_store():
+    import sli
+    return sli.Store(AWS, REGION, PROFILE, read_setting("EXPECTED_ACCOUNT", "483272865934"), env=UENV)
+sre.configure(kubectl=KUBECTL, env=UENV, account=read_setting("EXPECTED_ACCOUNT", "483272865934"), store=sli_store,
+              reports=os.path.join(REPO, "agent", "env", "reports"), db_id=read_setting("DB_INSTANCE", "bako-db"))
 T = flow_tab.THEMES[ss.theme]
 
 CSS = """
@@ -103,8 +133,11 @@ header[data-testid="stHeader"] { background: transparent; }
 .block-container { padding-top: 1.6rem; max-width: 1560px; }
 section[data-testid="stSidebar"] { background: @card@; }
 /* The sidebar always stays open: hide its collapse arrow, and if it was collapsed earlier, show it again. */
-[data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="stExpandSidebarButton"] { display: none !important; }
-section[data-testid="stSidebar"][aria-expanded="false"] { transform: none !important; margin-left: 0 !important; min-width: 300px !important; width: 300px !important; visibility: visible !important; }
+@media (min-width: 1000px) {
+  [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="stExpandSidebarButton"] { display: none !important; }
+  section[data-testid="stSidebar"][aria-expanded="false"] { transform: none !important; margin-left: 0 !important; min-width: 300px !important; width: 300px !important; visibility: visible !important; }
+}
+/* Below 1000 px the sidebar can be folded away again (the normal Streamlit arrow), so small screens are not eaten by it. */
 section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] h3 { color: @ink@; }
 .st-key-hdr { background: transparent; padding: 2px 6px 16px; }
 .st-key-hdr, .st-key-hdr div, .st-key-hdr span, .st-key-hdr p { color: @onFrame@; }
@@ -115,6 +148,7 @@ section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] h3 { color:
 .st-key-hdr .stButton button[kind="primary"] p, .st-key-hdr .stButton button[data-testid="stBaseButton-primary"] p { color: @onLime@ !important; }
 section[data-testid="stSidebar"] .stButton button { padding: 0 8px; font-size: 14px; }
 .stTabs .stButton button { padding: 0 14px; }
+.st-key-obs_panel { background: @page@; border-radius: 28px; padding: 22px 24px 18px; }
 .st-key-pendingbox { background: @card@; border-radius: 22px; padding: 16px 20px; margin-bottom: 14px; }
 .pagenote { display: flex; align-items: center; gap: 12px; background: @inset@; border-radius: 999px; padding: 10px 20px 10px 12px; font-size: 14px; margin-bottom: 16px; }
 .pagenote .i { flex: none; width: 28px; height: 28px; border-radius: 50%; background: @lime@; color: @onLime@; display: flex; align-items: center; justify-content: center; font-weight: 700; }
@@ -187,6 +221,31 @@ button[data-variant="segmented_control"][aria-checked="true"] p, button[data-var
 [data-baseweb="input"], [data-baseweb="base-input"], .stTextInput input { background: @card@ !important; color: @ink@ !important; }
 [data-testid="stAlert"] { background: @notice@; color: @ink@; }
 [data-testid="stAlert"] p { color: @ink@; }
+/* ---- fit every screen ---- */
+@media (max-width: 1700px) {
+  .stTabs [role="tablist"], .stTabs [data-baseweb="tab-list"] { padding-left: 12px !important; gap: 2px !important; overflow-x: auto !important; }
+  .stTabs [role="tab"], .stTabs [data-baseweb="tab"] { padding: 0 13px !important; flex: none; }
+  .stTabs [role="tab"] p, .stTabs [data-baseweb="tab"] p { font-size: 14px !important; }
+}
+@media (max-width: 1300px) {
+  /* chat moves under the page instead of squeezing it */
+  [data-testid="stHorizontalBlock"]:has(.st-key-chat) { flex-wrap: wrap !important; }
+  [data-testid="stHorizontalBlock"]:has(.st-key-chat) > [data-testid="stColumn"] { flex: 1 1 100% !important; min-width: 100% !important; width: 100% !important; }
+}
+@media (max-width: 1000px) {
+  /* rows of tiles wrap two by two */
+  [data-testid="stHorizontalBlock"]:has(.kpi) { flex-wrap: wrap !important; }
+  [data-testid="stHorizontalBlock"]:has(.kpi) > [data-testid="stColumn"] { flex: 1 1 calc(50% - 8px) !important; min-width: calc(50% - 8px) !important; }
+  .hello { font-size: 30px; }
+  .block-container { padding-left: 1rem !important; padding-right: 1rem !important; }
+}
+@media (max-width: 640px) {
+  [data-testid="stHorizontalBlock"]:has(.kpi) > [data-testid="stColumn"] { flex: 1 1 100% !important; min-width: 100% !important; }
+  /* the terminal's title row keeps its two buttons on the right instead of stacking them */
+  .st-key-term [data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+  .st-key-term [data-testid="stColumn"]:first-child { flex: 1 1 0 !important; min-width: 0 !important; width: auto !important; }
+  .st-key-term [data-testid="stColumn"]:nth-child(n+2) { flex: 0 0 44px !important; min-width: 44px !important; width: 44px !important; }
+}
 """
 for _k, _v in T.items():
     CSS = CSS.replace("@" + _k + "@", _v)
@@ -200,6 +259,28 @@ for key, default in (("chat", []), ("log", []), ("proc", None), ("q", None), ("a
                      ("logfile", None), ("hist", []), ("pending", None), ("tokens", 0), ("refresh", 0),
                      ("lastmode", None), ("snap", None), ("job", None), ("need_refresh", False), ("code_pr", None), ("code_pr_loaded", False)):
     ss.setdefault(key, default)
+
+## A hard refresh gives the browser a NEW, empty session. A START or STOP that is running must not be lost with it,
+## so the running process, its queue and its output live here, on the server (shared by every window), and the output
+## is also written to a file (so it survives a restart of the dashboard too).
+@st.cache_resource
+def run_registry():
+    return {"proc": None, "q": None, "log": [], "awaiting": None, "logfile": None, "lastmode": None,
+            "term_last": [], "term_code": 0}
+RUN = run_registry()
+RUN_OUT = os.path.join(REPO, "agent", "env", "reports", "run-output.log")
+
+def rehydrate():
+    if ss.proc is None and RUN["proc"] is not None:                       # a run is going: take it over
+        ss.proc, ss.q, ss.log = RUN["proc"], RUN["q"], RUN["log"]
+        ss.awaiting, ss.logfile, ss.lastmode = RUN["awaiting"], RUN["logfile"], RUN["lastmode"]
+    elif ss.proc is not None and RUN["proc"] is None:                     # another window already saw it finish
+        ss.proc = None
+    if ss.proc is None and not ss.get("term_last") and RUN["term_last"]:
+        ss.term_last, ss.term_code = RUN["term_last"], RUN["term_code"]
+    if ss.lastmode is None and RUN["lastmode"]:
+        ss.lastmode = RUN["lastmode"]
+rehydrate()
 
 def say(text):
     ss.chat.append(("assistant", text))
@@ -276,7 +357,7 @@ def get_pods():
 STAGE_LABELS = {"apply": "Terraform apply finished", "boot": "Cluster set up (bootstrap)", "trig": "Build requested on GitHub",
                 "build": "Images built", "push": "Images pushed to ECR", "bot": "Bot pull request opened",
                 "merge": "Pull request merged", "argo": "Argo CD synced", "ready": "READY checks all pass",
-                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked", "dns": "DNS name checked", "sli": "Request numbers saved"}
+                "sdb": "Database saved (snapshot)", "dbfind": "Saved database found", "dbchk": "Database rows checked", "dns": "DNS name checked", "sli": "Request numbers saved", "obs": "App facts saved"}
 
 def todays_events():
     events = []
@@ -377,12 +458,16 @@ def reports_page():
                 st.caption(ss.cost_msg)
 
     ## --- chart: estimate next to the real number ---
-    import pandas as pd
-    df = pd.DataFrame({"Estimated": [r["est_cost"] for r in reversed(rows)],
-                       "AWS actual": [r["aws_cost"] for r in reversed(rows)]},
-                      index=[r["date"][5:] for r in reversed(rows)])
     st.markdown("<div style='height:6px'></div><div class='ctitle'>Cost per day</div>", unsafe_allow_html=True)
-    st.bar_chart(df, color=[T["muted"], T["ink"]], height=240, stack=False)
+    show_chart(charts.cost_per_day(rows, T))
+    cl, cr = st.columns(2, gap="medium")
+    with cl:
+        st.markdown("<div class='ctitle'>Hours the lab ran</div>", unsafe_allow_html=True)
+        show_chart(charts.lab_hours_per_day(rows, T))
+    with cr:
+        st.markdown("<div class='ctitle'>Running total of cost</div>", unsafe_allow_html=True)
+        show_chart(charts.month_running_total(rows, usage.get_budget(REPO), T))
+    st.caption("The running total uses the real AWS number when it is known for a day, and the estimate for the other days. A red dashed line is your budget.")
 
     ## --- the table ---
     head = ("<tr><th>Day</th><th class='n'>Lab ran</th><th class='n'>Starts / stops</th><th class='n'>Estimated</th>"
@@ -406,66 +491,11 @@ def reports_page():
                "Today's AWS number is partial: AWS fills it in up to a day later.")
     questions_section()
 
-def slo_tab():
-    ## Request numbers from the load balancer logs (see sli.py). Counts and timings only. Measure-only: no target, no budget yet.
-    import sli
-    import pandas as pd
-    store = sli.Store(AWS, REGION, PROFILE, read_setting("EXPECTED_ACCOUNT", "483272865934"), env=UENV)
-    if "slo_days" not in ss:                              # read the small daily files once, then only on Refresh
-        ss.slo_days, ss.slo_msg = store.read_all_daily() if AWS else ([], "The AWS command line was not found on this computer.")
-    top1, top2 = st.columns([1, 5])
-    with top1:
-        if st.button("Refresh", key="slo_refresh", use_container_width=True,
-                     help="Reads today's load balancer logs and any missing day from S3 and saves the numbers. Logs arrive about 5 minutes late."):
-            with st.spinner("Reading the load balancer logs from S3..."):
-                ok, msgs = sli.rollup_missing(store, include_today=True) if AWS else (False, ["The AWS command line was not found."])
-                ss.slo_days, err = store.read_all_daily()
-                ss.slo_msg = err or ("; ".join(msgs[-2:]))
-            st.rerun()
-    with top2:
-        st.caption(ss.get("slo_msg") or "Days are UTC days (Cairo is 2 hours ahead). Only counts and timings are saved, never what you typed.")
-    days = [d for d in ss.slo_days if d.get("total", 0) > 0]
-    if not days:
-        st.markdown("<div class='card'><div class='ctitle'>No request numbers yet</div>"
-                    "<div class='sub'>Turn on the load balancer access logs (one line in K8s/ingress.yaml), start the lab, use the app for a few minutes, "
-                    "wait about 10 minutes, then press Refresh.</div></div>", unsafe_allow_html=True)
-        return
-    w = sli.window_summary(days, 30)
-    last = days[0]
-    kpis = [("Counted requests", f"{w['total']:,}", f"last 30 days · {w['days']} days with traffic"),
-            ("Success rate", f"{w['rate']:.2f}%", "measuring, no target yet"),
-            ("Failed or slow", f"{w['bad']:,}", f"a 5xx, or over {sli.SLOW_MS} ms"),
-            ("Slowest day, p95", f"{w['p95_ms_worst_day']} ms" if w["p95_ms_worst_day"] is not None else "-", "95 in 100 requests were faster")]
-    for col, (l, v, n) in zip(st.columns(4, gap="small"), kpis):
-        col.markdown(f"<div class='kpi'><div class='l'>{html.escape(l)}</div><div class='v'>{html.escape(str(v))}</div>"
-                     f"<div class='n'>{html.escape(n)}</div></div>", unsafe_allow_html=True)
-    st.write("")
-    ordered = list(reversed(days[:30]))
-    df = pd.DataFrame({"Good": [d["good"] for d in ordered], "Slow": [d["slow"] for d in ordered],
-                       "5xx errors": [d["status_5xx"] for d in ordered]}, index=[d["day"][5:] for d in ordered])
-    st.markdown("<div class='ctitle'>Requests per day</div>", unsafe_allow_html=True)
-    st.bar_chart(df, color=[T["muted"], T["ink"], T["badFg"]], height=220, stack=True)
-    head = ("<tr><th>Day (UTC)</th><th class='n'>Requests</th><th class='n'>Failed or slow</th><th class='n'>5xx</th>"
-            "<th class='n'>p50 ms</th><th class='n'>p95 ms</th><th>First to last</th><th class='n'>Not counted</th></tr>")
-    body = ""
-    for d in days[:14]:
-        bad_style = f" style='color:{T['badFg']}'" if d["bad"] else ""
-        span = f"{str(d['first'])[:5]} to {str(d['last'])[:5]}"
-        body += (f"<tr style='white-space:nowrap'><td>{html.escape(d['day'])}{' (so far)' if d['day'] == datetime.now(timezone.utc).date().isoformat() else ''}</td>"
-                 f"<td class='n'>{d['total']}</td><td class='n'{bad_style}>{d['bad']}</td><td class='n'>{d['status_5xx']}</td>"
-                 f"<td class='n'>{d['p50_ms'] if d['p50_ms'] is not None else '-'}</td>"
-                 f"<td class='n'>{d['p95_ms'] if d['p95_ms'] is not None else '-'}</td>"
-                 f"<td>{html.escape(span)}</td><td class='n'>{d.get('noise', 0)}</td></tr>")
-    st.markdown(f"<div class='card'><table class='rtable'>{head}{body}</table></div>", unsafe_allow_html=True)
-    st.caption("Counted = reached a pod, or the load balancer failed it. Not counted = redirects from port 80 and bot hits the load balancer answers itself. "
-               "4xx answers count as good. The target and the error budget come after about two weeks of real numbers.")
-    if last.get("bad_requests"):
-        head = "<tr><th>Time (UTC)</th><th class='n'>Status</th><th>Area</th><th class='n'>Took</th></tr>"
-        body = "".join(f"<tr><td>{html.escape(b['time'])}</td><td class='n'>{b['status']}</td><td>{html.escape(b['area'])}</td>"
-                       f"<td class='n'>{str(b['ms']) + ' ms' if b['ms'] is not None else '-'}</td></tr>" for b in last["bad_requests"][:15])
-        st.markdown(f"<div class='ctitle' style='margin-top:10px'>Counted against you on {html.escape(last['day'])}</div>"
-                    f"<div class='card'><table class='rtable'>{head}{body}</table></div>", unsafe_allow_html=True)
-        st.caption("Only time, status, area and duration are kept.")
+def show_chart(ch):
+    try:
+        st.altair_chart(ch, width="stretch", theme=None)
+    except TypeError:                                   # older Streamlit
+        st.altair_chart(ch, use_container_width=True, theme=None)
 
 def cents(x):
     return f"${x:.4f}" if x < 0.1 else f"${x:.2f}"
@@ -532,11 +562,19 @@ def questions_section():
 ## The thread must not touch st.* or session_state; it only fills a plain dict.
 ## ---------------------------------------------------------------
 def compute_snapshot():
-    snap = {"status": get_status(), "hours": None, "pods": None, "at": time.strftime("%H:%M:%S")}
+    snap = {"status": get_status(), "hours": None, "pods": None, "at": time.strftime("%H:%M:%S"), "ts": time.time(), "started": None}
     if snap["status"]["state"] != "DOWN":
         snap["hours"] = get_uptime_hours()
         snap["pods"] = get_pods()
+        if snap["hours"] is not None:
+            snap["started"] = snap["ts"] - snap["hours"] * 3600
     return snap
+
+def hours_now(snap):
+    ## Hours the lab has been up, counted from the start time in the last check, so the number keeps moving by itself.
+    if not snap or snap.get("started") is None:
+        return None
+    return max(0.0, (time.time() - snap["started"]) / 3600)
 
 def start_job():
     holder = {}
@@ -565,18 +603,29 @@ def launch(mode, frm=""):
         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
     ss.proc, ss.q = proc, queue.Queue()
     ss.log, ss.awaiting, ss.logfile, ss.lastmode = [], None, None, mode
+    RUN.update(proc=proc, q=ss.q, log=ss.log, awaiting=None, logfile=None, lastmode=mode)
+    try:
+        os.makedirs(os.path.dirname(RUN_OUT), exist_ok=True)
+        with open(RUN_OUT, "w", encoding="utf-8") as f:
+            f.write(f"[run] STARTED: {mode.upper()}  ({time.strftime('%H:%M:%S')})\n")
+    except OSError:
+        pass
     ss.pr_review, ss.merge_msg = None, None
     threading.Thread(target=reader, args=(proc, ss.q), daemon=True).start()
 
 def drain():
+    done, fresh = False, []
     while True:
         try:
             line = ss.q.get_nowait()
         except queue.Empty:
-            return False
+            break
         if line is None:
-            return True
+            done = True
+            break
+        line = redact.redact(line)                      # a password or token never reaches the terminal, the chat or the file
         ss.log.append(line)
+        fresh.append(line)
         if "APPROVAL NEEDED" in line:
             ss.awaiting = "destroy bako" if "DESTROY" in line else "approved"
         if "tail -f " in line:
@@ -584,6 +633,14 @@ def drain():
         m = re.search(r"Log: (\S+\.log)", line)        # later steps (bootstrap...) announce their log this way
         if m:
             ss.logfile = m.group(1)
+    if fresh:
+        try:
+            with open(RUN_OUT, "a", encoding="utf-8") as f:
+                f.write("\n".join(fresh) + "\n")
+        except OSError:
+            pass
+    RUN["awaiting"], RUN["logfile"] = ss.awaiting, ss.logfile
+    return done
 
 def send_to_agent(text):
     try:
@@ -592,12 +649,16 @@ def send_to_agent(text):
     except OSError:
         say("The agent is no longer listening.")
     ss.awaiting = None
+    RUN["awaiting"] = None
 
 ## ---------------------------------------------------------------
 ## 6. THE CHAT (model-driven; it can only PROPOSE actions)
 ## ---------------------------------------------------------------
 def handle_keywords(text):
     t = text.lower()
+    if len(t.split()) > 6:                      # a long question is not a command: never start or stop because of a word inside it
+        say("I cannot answer questions without the AI model (no OpenAI key, or it is not reachable). In this mode I only understand a short 'start' or 'stop'.")
+        return
     if any(w in t for w in ("stop", "destroy", "shut down", "tear down")):
         say("Starting STOP. I will plan the destroy first.")
         launch("stop")
@@ -617,34 +678,83 @@ def apply_action(action):
     elif action["type"] == "commit_push":
         ss.pending = action
 
-def handle(text):
+## The model call runs in a background thread and the result waits in a server-wide slot, so switching pages
+## (or a refresh) while Bako is thinking can never lose the answer.
+@st.cache_resource
+def chat_registry():
+    return {"job": None}
+CHAT = chat_registry()
+
+def chat_active():
+    j = CHAT["job"]
+    return bool(j) and not j["applied"]
+
+def handle(text, shown=None, mode="lab"):
     client = get_client()
     if client is None:
         say("No OpenAI key found, so I use keyword mode.")
         return handle_keywords(text)
-    try:
-        with st.spinner("Bako is thinking..."):
-            reply, action, used = bako_chat.run_turn(client, MODEL, ss.hist, text, REPO)
-    except Exception as e:
-        ss.chat_trace = {"question": text, "tools": [], "tokens": 0, "model": MODEL, "proposal": None,
-                         "trace": getattr(bako_chat, "LAST_TRACE", None), "error": f"{type(e).__name__}: {e}"[:300]}
-        say(f"The model is not reachable ({type(e).__name__}). Keyword mode: say start or stop.")
-        return handle_keywords(text)
+    j = {"text": text, "shown": shown or text, "done": False, "applied": False, "t0": time.time(), "hist": ss.hist, "mode": mode}
+    CHAT["job"] = j
+    def work():
+        try:
+            reply, action, used = bako_chat.run_turn(client, MODEL, j["hist"], j["text"], REPO, mode=j["mode"])
+            j.update(reply=reply, action=action, used=used, tools=getattr(bako_chat, "LAST_TOOLS", None),
+                     trace=getattr(bako_chat, "LAST_TRACE", None))
+        except Exception as e:
+            j.update(error=f"{type(e).__name__}: {e}"[:300], trace=getattr(bako_chat, "LAST_TRACE", None))
+        j["done"] = True
+    threading.Thread(target=work, daemon=True).start()
+
+def finish_chat_if_done():
+    ## runs at the top of every page run: when the background answer is ready, put it into this session
+    j = CHAT["job"]
+    if not j or j["applied"] or not j["done"]:
+        return False
+    j["applied"] = True
+    if not any(r == "user" and t == j["shown"] for r, t in ss.chat):      # this browser tab was refreshed meanwhile
+        ss.chat.append(("user", j["shown"]))
+    if j.get("error"):
+        ss.chat_trace = {"question": j["text"], "tools": [], "tokens": 0, "model": MODEL, "proposal": None,
+                         "trace": j.get("trace"), "error": j["error"]}
+        say(f"The model is not reachable ({j['error'].split(':')[0]}). Keyword mode: say start or stop.")
+        handle_keywords(j["text"])
+        return True
+    used, action = j.get("used", 0), j.get("action")
     ss.tokens += used
     usage.add_chat_tokens(REPO, used)           # kept for the daily report
-    ## what the Flow tab shows for "Bako and AI" (tool details need bako_chat.LAST_TOOLS)
-    ss.chat_trace = {"question": text, "tools": getattr(bako_chat, "LAST_TOOLS", None),
-                     "tokens": used, "model": MODEL, "proposal": (action or {}).get("type"),
-                     "trace": getattr(bako_chat, "LAST_TRACE", None)}
+    ss.chat_trace = {"question": j["text"], "tools": j.get("tools"), "tokens": used, "model": MODEL,
+                     "proposal": (action or {}).get("type"), "trace": j.get("trace")}
     try:                                       # what this message cost, and whether that is normal for you
         qr = usage.questions(REPO)
         if qr:
             ss.chat_trace["cost"] = dict(usage.judge(qr[0], usage.reference(qr[1:])), dollars=qr[0]["cost"])
     except Exception:
         pass
-    say(reply or "(no reply)")
+    if j.get("mode") == "sre":                  # keep the case: what it was given, what it called, what it answered (later: Bako is tested on these)
+        tr = j.get("trace") or {}
+        sre.save_case(os.path.join(REPO, "agent", "env", "reports"), {
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "label": j["shown"], "question_chars": len(j["text"]),
+            "evidence": (ss.get("obs_case") or {}).get("items"), "tools": [{"name": c["name"], "arguments": c["arguments"], "ok": c["ok"], "ms": c["ms"]} for c in tr.get("calls", [])],
+            "reply": j.get("reply"), "tokens": used, "model": MODEL, "stopped_by": tr.get("stopped_by")})
+    say(j.get("reply") or "(no reply)")
     if action:
         apply_action(action)
+    return True
+
+def obs_ask(full, shown=None, items=None):
+    ## a question from the Observability page: it goes to Bako in SRE mode (its own read-only tools), with the evidence pack inside the text
+    ss.flow_prompt = (redact.redact(full), shown)
+    ss.flow_mode = "sre"
+    ss.obs_case = {"items": items or [], "label": shown}
+
+def obs_answer():
+    if chat_active():
+        return "thinking", ""
+    for role, text in reversed(ss.chat):
+        if role == "assistant":
+            return "done", text
+    return "none", ""
 
 ## ---------------------------------------------------------------
 ## 7. THE LIVE PART OF THE PAGE (a "fragment")
@@ -664,6 +774,7 @@ def finish_run_if_done():
     say("**" + results[-1] + "**" if results else f"The run ended (exit code {code}).")
     ss.term_last, ss.term_code = list(ss.log), code      # the terminal keeps showing the last run until the next one
     ss.proc, ss.log, ss.awaiting, ss.logfile = None, [], None, None
+    RUN.update(proc=None, q=None, log=[], awaiting=None, logfile=None, term_last=ss.term_last, term_code=code)
     ss.need_refresh = True                    # the lab changed: read it again
     return True
 
@@ -774,6 +885,7 @@ def code_pr_card():
 TERM_H = {"open": 250, "min": 56, "max": 620}
 
 def _term_row(line):
+    line = redact.redact(line)                      # last guard: whatever the source (agent, log file tail, saved run), secrets are hidden
     s = html.escape(line)
     up = line.upper()
     cls = "tx"
@@ -811,14 +923,28 @@ def last_run_from_trace():
             pass
     return lines, mode
 
+def last_output_lines():
+    ## The full text of the last run, saved while it ran (survives a refresh and a restart of the dashboard).
+    try:
+        with open(RUN_OUT, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return [], ""
+    m = re.search(r"STARTED: (\w+)", lines[0]) if lines else None
+    return lines[-400:], (m.group(1).lower() if m else "")
+
 def terminal_dock():
     live = ss.proc is not None
     lines = list(ss.log) if live else list(ss.get("term_last") or [])
     from_record, rec_mode = False, ""
     if not lines and not live:
-        lines, rec_mode = last_run_from_trace()          # nothing ran in this window: show the last recorded run
+        lines, rec_mode = last_output_lines()            # nothing ran in this window: the saved text of the last run
+        if len(lines) < 2:
+            lines, rec_mode = last_run_from_trace()      # no saved text: rebuild the steps from the trace
         from_record = True
-    state = ss.get("term") or ("min" if from_record else "open")
+    if "term" not in ss:
+        ss.term = ui_get("term", None)
+    state = ss.term or ("min" if from_record else "open")
     h = TERM_H.get(state, TERM_H["open"])
     mode = (ss.lastmode or rec_mode or "run").upper()
     if live:
@@ -832,7 +958,7 @@ def terminal_dock():
         path = os.path.join(REPO, ss.logfile)
         if os.path.exists(path):
             with open(path, encoding="utf-8", errors="replace") as f:
-                tail = f.read().splitlines()[-20:]
+                tail = [redact.redact(x) for x in f.read().splitlines()[-20:]]
             rows = rows + [f"-- {os.path.basename(path).split('-')[0]} log, last lines --"] + tail
     last = next((l.strip() for l in reversed(lines) if l.strip()), "no run yet")
     if len(last) > 90:
@@ -861,12 +987,18 @@ def terminal_dock():
         c0.markdown(f"<div class='tm-h'><span class='tm-chip'>{html.escape(chip)}</span><b>Terminal · {html.escape(mode)}</b>"
                     f"<span class='tm-sub'>now: {html.escape(last)}</span></div>", unsafe_allow_html=True)
         if c1.button("", key="term_min", icon=":material/remove:" if state != "min" else ":material/expand_less:",
-                     help="Minimize" if state != "min" else "Restore"):
+                     help="Minimize" if state != "min" else "Show the output"):
             ss.term = "open" if state == "min" else "min"
+            ui_set("term", ss.term)
             st.rerun(scope="fragment")
         if c2.button("", key="term_max", icon=":material/open_in_full:" if state != "max" else ":material/close_fullscreen:",
-                     help="Maximize" if state != "max" else "Restore size"):
-            ss.term = "open" if state == "max" else "max"
+                     help="Maximize" if state != "max" else "Back to the size it had"):
+            if state != "max":
+                ss.term_prev = state                     # remember where to go back to
+                ss.term = "max"
+            else:
+                ss.term = ss.get("term_prev") or "min"
+            ui_set("term", ss.term if ss.term != "max" else ss.get("term_prev", "min"))
             st.rerun(scope="fragment")
         if state != "min":
             st.markdown("<div class='tm-body'><div class='tm-in'>" + "".join(_term_row(r) for r in rows) + "</div></div>",
@@ -1002,7 +1134,21 @@ if ss.get("page") == "reports":
 ## ---------------------------------------------------------------
 ## 9. THE PAGE: main column on the left, chat on the right
 ## ---------------------------------------------------------------
-main, side = st.columns([2.5, 1.5], gap="medium")
+finish_chat_if_done()
+
+def ask_bako(text):
+    ss.flow_prompt = redact.redact(text)          # secrets hidden; picked up by the chat box after the next full re-run
+
+def rerun_from(stage_id):
+    if not running:                               # one run at a time
+        say(f"Re-running START from '{stage_id}'. Plan and apply are not repeated; finished steps are skipped.")
+        launch("start", stage_id)
+
+def page_note(text):
+    st.markdown(f"<div class='pagenote'><span class='i'>i</span><span><b>On this page:</b> {html.escape(text)}</span></div>",
+                unsafe_allow_html=True)
+
+main, side = st.columns([3.3, 1.3] if ss.view == "Observability" else [2.5, 1.5], gap="medium")
 
 with main:
     ## --- header: greeting, state, Start / Stop ---
@@ -1014,112 +1160,137 @@ with main:
     else:
         state = status["state"] if status else "CHECKING"
         color = {"READY": "#2E8B57", "DOWN": "#8A8575", "NOT READY": "#D98A1F"}.get(state, "#8A8575")
-        hours = snap["hours"] if snap else None
+        hours = hours_now(snap)
     label = {"READY": "The lab is UP and READY", "DOWN": "The lab is DOWN, nothing is running",
              "NOT READY": "Some resources exist, but the lab is NOT READY",
              "CHECKING": "Checking AWS, this takes about 30 seconds..."}.get(state, f"Bako is running: {state}")
     with st.container(key="hdr"):
-        st.markdown(f"<div class='sub'>{time.strftime('%a %d %b %Y')}</div>"
-                    f"<div class='hello'>{greet}, {html.escape(NAME)}</div>"
-                    f"<div style='font-size:16px;font-weight:500'><span class='dot' style='background:{color}'></span>"
-                    f"{html.escape(label)}"
-                    f"{' <span class=sub>· running ' + fmt_hours(hours) + '</span>' if hours is not None else ''}</div>",
-                    unsafe_allow_html=True)
-        b1, b2, _ = st.columns([1.6, 1.6, 3])
-        if b1.button("Start lab", disabled=running):
-            say("Starting the lab. I will plan first, then ask you to approve."); launch("start"); st.rerun()
-        if b2.button("Stop lab", type="primary", disabled=running):
-            say("Stopping the lab. I will plan the destroy first, then ask you to approve."); launch("stop"); st.rerun()
+        @st.fragment(run_every=30)
+        def header_status():
+            h = None if running else hours_now(snap)
+            st.markdown(f"<div class='sub'>{time.strftime('%a %d %b %Y')}</div>"
+                        f"<div class='hello'>{greet}, {html.escape(NAME)}</div>"
+                        f"<div style='font-size:16px;font-weight:500'><span class='dot' style='background:{color}'></span>"
+                        f"{html.escape(label)}"
+                        f"{' <span class=sub>· running ' + fmt_hours(h) + '</span>' if h is not None else ''}</div>",
+                        unsafe_allow_html=True)
+        header_status()
+        with st.container(key="viewswitch"):
+            vsel = st.segmented_control("View", ["Operator", "Observability", "Bako & AI"], default=ss.view, key="view_sel",
+                                        label_visibility="collapsed",
+                                        help="Operator: the lab, cost, AWS, cluster, repo. Observability: how the Bako application is doing for its users. Bako & AI: what Bako (the AI) did and what it cost.")
+            if vsel and vsel != ss.view:
+                ss.view = vsel; ui_set("view", vsel); st.rerun()
+        if ss.view == "Operator":
+            b1, b2, _ = st.columns([1.6, 1.6, 3])
+            if b1.button("Start lab", disabled=running):
+                say("Starting the lab. I will plan first, then ask you to approve."); launch("start"); st.rerun()
+            if b2.button("Stop lab", type="primary", disabled=running):
+                say("Stopping the lab. I will plan the destroy first, then ask you to approve."); launch("stop"); st.rerun()
 
-    ## --- a proposed commit + push waits for "push bako" ---
-    if ss.pending:
-        a = ss.pending
-        with st.container(key="pendingbox"):
-            st.warning(bako_chat.describe_action(a))
-            stamp = a["branch"].rsplit("-", 2)[-2] + "-" + a["branch"].rsplit("-", 1)[-1]
-            label = st.text_input("Branch name (optional): a few words, for example prmerge-fix. Bako adds the bako/update- start and the time.",
-                                  key="branch_label_" + stamp, placeholder="leave empty for the automatic name")
-            a["branch"] = bako_chat.branch_for(label, stamp)
-            st.caption(f"The branch will be: {a['branch']}")
-    if ss.code_pr:
-        code_pr_card()
+    if ss.view == "Observability":
+        obs.show(dict(ss=ss, store=sli_store(), ask=obs_ask,
+                      answer=obs_answer, aws_ok=bool(AWS), kubectl=KUBECTL, env=UENV, page_note=page_note,
+                      account=read_setting("EXPECTED_ACCOUNT", "483272865934"), db_id=read_setting("DB_INSTANCE", "bako-db"),
+                      reports=os.path.join(REPO, "agent", "env", "reports")))
+    elif ss.view == "Bako & AI":
+        with st.container(key="obs_panel"):
+            page_note("what Bako (the AI) did when you asked it something: which tools it used, the tokens, what it cost, and the full record of each message. Bako answers from every page.")
+            flow_tab.show(REPO, running=running, on_ask=ask_bako, theme=ss.theme, chat_trace=ss.get("chat_trace"),
+                          on_rerun=rerun_from, only=("chat",))
+            questions_section()
+    else:
+        ## --- a proposed commit + push waits for "push bako" ---
+        if ss.pending:
+            a = ss.pending
+            with st.container(key="pendingbox"):
+                st.warning(bako_chat.describe_action(a))
+                stamp = a["branch"].rsplit("-", 2)[-2] + "-" + a["branch"].rsplit("-", 1)[-1]
+                label = st.text_input("Branch name (optional): a few words, for example prmerge-fix. Bako adds the bako/update- start and the time.",
+                                      key="branch_label_" + stamp, placeholder="leave empty for the automatic name")
+                a["branch"] = bako_chat.branch_for(label, stamp)
+                st.caption(f"The branch will be: {a['branch']}")
+        if ss.code_pr:
+            code_pr_card()
 
-    ## --- tabs ---
-    t_lab, t_flow, t_slo, t_infra, t_cluster, t_repo = st.tabs([":material/science: Lab", ":material/account_tree: Flow", ":material/speed: SLO",
-                                                                ":material/cloud: AWS", ":material/hub: Cluster", ":material/folder: Repo"])
-    def page_note(text):
-        st.markdown(f"<div class='pagenote'><span class='i'>i</span><span><b>On this page:</b> {html.escape(text)}</span></div>",
-                    unsafe_allow_html=True)
+        ## --- tabs ---
+        t_lab, t_flow, t_infra, t_cluster, t_repo = st.tabs([":material/science: Lab", ":material/account_tree: Flow",
+                                                              ":material/cloud: AWS", ":material/hub: Cluster", ":material/folder: Repo"])
+        def page_note(text):
+            st.markdown(f"<div class='pagenote'><span class='i'>i</span><span><b>On this page:</b> {html.escape(text)}</span></div>",
+                        unsafe_allow_html=True)
 
-    with t_lab:
-        page_note("is the lab up, what it costs so far, and the checks that prove it works. Use Start lab and Stop lab at the top.")
-        pods = None if running or not snap else snap["pods"]
-        cost = f"${hours * HOURLY:.2f}" if hours is not None else ("$0.00" if state == "DOWN" else "—")
-        kpis = [
-            ("Lab", state if not running else "BUSY", {"READY": "all checks pass", "DOWN": "nothing billing"}.get(state, "see checks below")),
-            ("Running for", fmt_hours(hours) if hours is not None else "—", "since the cluster was created"),
-            ("Estimated cost", cost, f"about ${HOURLY:.2f} per hour"),
-            ("Pods", f"{pods['ready']} / {pods['total']}" if pods else "—", f"{pods['restarts']} restarts" if pods else "not running"),
-        ]
-        for col, (l, v, n) in zip(st.columns(4, gap="small"), kpis):
-            col.markdown(f"<div class='kpi'><div class='l'>{html.escape(l)}</div>"
-                         f"<div class='v'>{html.escape(str(v))}</div><div class='n'>{html.escape(n)}</div></div>",
-                         unsafe_allow_html=True)
-        st.write("")
-        left, right = st.columns([1.15, 1], gap="medium")
-        with left:
-            with st.container(key="checks"):
-                h1, h2 = st.columns([2, 1.3])
-                title = "Checks right now" if state != "READY" else "READY checks"
-                h1.markdown(f"<div class='ctitle'>{title}</div>", unsafe_allow_html=True)
-                if h2.button("Refresh", disabled=running or checking):
-                    ss.need_refresh = True; st.rerun()
-                rows = status["rows"] if status else []
-                body = "".join(
-                    f"<div class='row'><span>{html.escape(t)}</span>"
-                    f"<span class='pill {'ok' if r == 'PASS' else 'bad'}'>{r}</span></div>" for r, t in rows)
-                st.markdown(body or ("<div class='sub'>Checks are paused while a run is active.</div>" if running
-                                     else "<div class='sub'>No results yet.</div>"), unsafe_allow_html=True)
-                if checking:
-                    st.caption("Checking AWS in the background… the numbers above update when it finishes.")
-                elif snap:
-                    st.caption(f"Checked at {snap['at']}. Press Refresh to check again.")
-        with right:
-            with st.container(key="today"):
-                events = todays_events()
-                shown = events if ss.get("today_all") else events[-6:]
-                lines = "".join(f"<div class='tl'><span class='t'>{t}</span><span>{html.escape(x)}</span></div>"
-                                for t, x in shown) or "<div class='tl'><span>Nothing recorded yet today.</span></div>"
-                more = f" · last {len(shown)} of {len(events)}" if len(shown) < len(events) else ""
-                st.markdown(f"<div class='ctitle'>Today{more}</div>{lines}", unsafe_allow_html=True)
-                if len(events) > 6 and st.button("Show less" if ss.get("today_all") else f"Show all {len(events)} events",
-                                                 key="today_toggle", use_container_width=True):
-                    ss.today_all = not ss.get("today_all")
-                    st.rerun()
+        with t_lab:
+            page_note("is the lab up, what it costs so far, and the checks that prove it works. Use Start lab and Stop lab at the top.")
+            @st.fragment(run_every=30)
+            def lab_kpis():
+                h = None if running else hours_now(snap)
+                pods = None if running or not snap else snap["pods"]
+                cost = f"${h * HOURLY:.2f}" if h is not None else ("$0.00" if state == "DOWN" else "—")
+                kpis = [
+                    ("Lab", state if not running else "BUSY", {"READY": "all checks pass", "DOWN": "nothing billing"}.get(state, "see checks below")),
+                    ("Running for", fmt_hours(h) if h is not None else "—", "since the cluster was created"),
+                    ("Estimated cost", cost, f"about ${HOURLY:.2f} per hour"),
+                    ("Pods", f"{pods['ready']} / {pods['total']}" if pods else "—", f"{pods['restarts']} restarts" if pods else "not running"),
+                ]
+                for col, (l, v, n) in zip(st.columns(4, gap="small"), kpis):
+                    col.markdown(f"<div class='kpi'><div class='l'>{html.escape(l)}</div>"
+                                 f"<div class='v'>{html.escape(str(v))}</div><div class='n'>{html.escape(n)}</div></div>",
+                                 unsafe_allow_html=True)
+            lab_kpis()
+            st.write("")
+            left, right = st.columns([1.15, 1], gap="medium")
+            with left:
+                with st.container(key="checks"):
+                    h1, h2 = st.columns([2, 1.3])
+                    title = "Checks right now" if state != "READY" else "READY checks"
+                    h1.markdown(f"<div class='ctitle'>{title}</div>", unsafe_allow_html=True)
+                    if h2.button("Refresh", disabled=running or checking):
+                        ss.need_refresh = True; st.rerun()
+                    rows = status["rows"] if status else []
+                    body = "".join(
+                        f"<div class='row'><span>{html.escape(t)}</span>"
+                        f"<span class='pill {'ok' if r == 'PASS' else 'bad'}'>{r}</span></div>" for r, t in rows)
+                    st.markdown(body or ("<div class='sub'>Checks are paused while a run is active.</div>" if running
+                                         else "<div class='sub'>No results yet.</div>"), unsafe_allow_html=True)
+                    if checking:
+                        st.caption("Checking AWS in the background… the numbers above update when it finishes.")
+                    elif snap:
+                        st.caption(f"Checked at {snap['at']}. Press Refresh to check again.")
+            with right:
+                with st.container(key="today"):
+                    events = todays_events()
+                    shown = events if ss.get("today_all") else events[-6:]
+                    lines = "".join(f"<div class='tl'><span class='t'>{t}</span><span>{html.escape(x)}</span></div>"
+                                    for t, x in shown) or "<div class='tl'><span>Nothing recorded yet today.</span></div>"
+                    more = f" · last {len(shown)} of {len(events)}" if len(shown) < len(events) else ""
+                    st.markdown(f"<div class='ctitle'>Today{more}</div>{lines}", unsafe_allow_html=True)
+                    if len(events) > 6 and st.button("Show less" if ss.get("today_all") else f"Show all {len(events)} events",
+                                                     key="today_toggle", use_container_width=True):
+                        ss.today_all = not ss.get("today_all")
+                        st.rerun()
 
-    with t_flow:
-        page_note("every step of a START or STOP, in order. Click a box to see what the step does and what to do if it fails.")
-        def ask_bako(text):
-            ss.flow_prompt = redact.redact(text)      # secrets hidden; picked up by the chat box after the next full re-run
-        def rerun_from(stage_id):
-            if not running:                           # one run at a time
-                say(f"Re-running START from '{stage_id}'. Plan and apply are not repeated; finished steps are skipped.")
-                launch("start", stage_id)
-        flow_tab.show(REPO, running=running, on_ask=ask_bako, theme=ss.theme, chat_trace=ss.get("chat_trace"),
-                      on_rerun=rerun_from)
+        with t_flow:
+            page_note("every step of a START or STOP, in order. Click a box to see what the step does and what to do if it fails.")
+            def ask_bako(text):
+                ss.flow_prompt = redact.redact(text)      # secrets hidden; picked up by the chat box after the next full re-run
+            def rerun_from(stage_id):
+                if not running:                           # one run at a time
+                    say(f"Re-running START from '{stage_id}'. Plan and apply are not repeated; finished steps are skipped.")
+                    launch("start", stage_id)
+            flow_tab.show(REPO, running=running, on_ask=ask_bako, theme=ss.theme, chat_trace=ss.get("chat_trace"),
+                          on_rerun=rerun_from, only=("start", "stop"))
 
-    with t_slo:
-        page_note("how many requests the app answered, how many failed or were slow, and how fast. Numbers come from the load balancer logs in S3, so they stay here while the lab is off.")
-        slo_tab()
-    with t_infra:
-        page_note("what AWS is running for the lab, and whether anything is still billing.")
-        tabs.aws_tab(dict(repo=REPO, env=UENV, bash=BASH, T=T, hourly=HOURLY, up_now=up_now))
-    with t_cluster:
-        page_note("the programs (pods) running inside the cluster, the machines they run on, and recent warnings. Click a row to see details on the right.")
-        tabs.cluster_tab(dict(repo=REPO, env=UENV, kubectl=KUBECTL, state=state, T=T))
-    with t_repo:
-        page_note("your code on GitHub: recent CI runs, pull requests and your uncommitted changes. Click a row to see details on the right.")
-        tabs.repo_tab(dict(repo=REPO, env=UENV, gh=GHCLI, T=T))
+        with t_infra:
+            page_note("what AWS is running for the lab, and whether anything is still billing.")
+            tabs.aws_tab(dict(repo=REPO, env=UENV, bash=BASH, T=T, hourly=HOURLY, up_now=up_now))
+        with t_cluster:
+            page_note("the programs (pods) running inside the cluster, the machines they run on, and recent warnings. Click a row to see details on the right.")
+            tabs.cluster_tab(dict(repo=REPO, env=UENV, kubectl=KUBECTL, state=state, T=T))
+        with t_repo:
+            page_note("your code on GitHub: recent CI runs, pull requests and your uncommitted changes. Click a row to see details on the right.")
+            tabs.repo_tab(dict(repo=REPO, env=UENV, gh=GHCLI, T=T))
+
 
 with side:
     with st.container(key="chat"):
@@ -1131,13 +1302,25 @@ with side:
             for role, text in ss.chat:
                 with st.chat_message(role):
                     st.markdown(text)
+        if chat_active():
+            with box:
+                with st.chat_message("assistant"):
+                    st.markdown("Bako is thinking... (you can switch pages, the answer is kept)")
         prompt = st.chat_input("Ask about the lab, the repo, an error…")
-        prompt = ss.pop("flow_prompt", None) or prompt          # a "troubleshoot this step" click from the Flow tab
+        fp = ss.pop("flow_prompt", None)                        # a "troubleshoot this" click from the Flow tab or the Observability page
+        fmode = ss.pop("flow_mode", "lab") if fp else "lab"      # Observability questions use the SRE mode, everything else the lab mode
+        shown = None
+        if fp:
+            prompt, shown = (fp if isinstance(fp, tuple) else (fp, None))
         if prompt:
-            ss.chat.append(("user", prompt))
+            shown = shown or prompt
+            if chat_active():
+                ss.chat.append(("assistant", "I am still thinking about the last question. Please send this again in a moment."))
+                st.rerun()
+            ss.chat.append(("user", shown))
             with box:                                            # show the question at once, before the answer is ready
                 with st.chat_message("user"):
-                    st.markdown(prompt)
+                    st.markdown(shown)
             if ss.pending:
                 action, ss.pending = ss.pending, None
                 if prompt.strip() == "push bako":
@@ -1155,11 +1338,25 @@ with side:
             elif running:
                 say("I am in the middle of a run. Please wait until it finishes.")
             else:
-                with box:                                        # the "thinking" spinner appears under the question
-                    handle(prompt)
+                handle(prompt, shown, fmode)                     # starts in the background; the page keeps working
             st.rerun()
 
+    @st.fragment(run_every=1 if chat_active() else None)
+    def chat_poller():
+        j = CHAT["job"]
+        if j and j["done"] and not j["applied"]:
+            st.rerun()                                           # one full re-run: chat, Observability and Bako & AI all update
+        elif j and not j["applied"]:
+            pass
+    chat_poller()
+
     ## --- live area: approval box and run output, under the chat (refreshes by itself) ---
+    @st.fragment(run_every=60)
+    def snap_poller():
+        if ss.proc is None and ss.job is None and ss.snap is not None and time.time() - ss.snap.get("ts", 0) > 180:
+            ss.need_refresh = True
+            st.rerun()
+    snap_poller()
     busy = ss.proc is not None or ss.job is not None
     st.fragment(live_panel, run_every=1 if busy else None)()
 
