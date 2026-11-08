@@ -21,6 +21,14 @@ spec:
           ports:
             - containerPort: 8000
           env:
+            - name: OTEL_TRACING_ENABLED
+              value: "true"
+            - name: OTEL_SERVICE_NAME
+              value: "bako-backend"
+            - name: OTEL_DEPLOYMENT_ENVIRONMENT
+              value: "eks-lab"
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: "http://jaeger.bako.svc.cluster.local:4318/v1/traces"
             - name: DB_HOST
               value: "bako-db.c16ocgiqooad.eu-north-1.rds.amazonaws.com"
             - name: POSTGRES_PORT

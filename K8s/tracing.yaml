@@ -1,0 +1,69 @@
+# Trace receiver: collects the backend's OpenTelemetry traces so the Observability > Traces tab (and Bako) can see where one request spends its time.
+# Jaeger "all-in-one" keeps the newest traces IN MEMORY only. No disk, no AWS cost, nothing to clean up. The pod's traces vanish at STOP, which is fine:
+# the STOP stage "Save app facts" writes the numbers (per endpoint, per query shape) to S3 first.
+# Only the backend can reach it (ClusterIP, no Ingress). The dashboard reads it through a short-lived pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: bako
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.62.0
+          env:
+            - name: SPAN_STORAGE_TYPE
+              value: memory
+            - name: MEMORY_MAX_TRACES
+              value: "5000"          # oldest traces are dropped after this many
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+            - name: query
+              containerPort: 16686
+            - name: admin
+              containerPort: 14269
+          readinessProbe:
+            httpGet:
+              path: /
+              port: admin
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 384Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: bako
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+    - name: query
+      port: 16686
+      targetPort: query

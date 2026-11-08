@@ -7,6 +7,14 @@ from openai import OpenAI
 import keyring
 import redact                         # hides secrets before they reach the trace or the model
 import sli                            # request numbers from the load balancer logs (counts and timings only)
+try:
+    import obs_data                   # backend pod and database facts (read-only; saved once a day at STOP)
+except ImportError:
+    obs_data = None                   # not installed: the STOP step is skipped, nothing else changes
+try:
+    import obs_traces                 # where the time of a request goes (read from the trace receiver; saved with the daily facts)
+except ImportError:
+    obs_traces = None
 MODEL = os.environ.get("AGENT_MODEL", "gpt-5.4-nano")
 API_KEY = os.environ.get("OPENAI_API_KEY") or keyring.get_password("bako-agent", "OPENAI_API_KEY")
 if not API_KEY:
@@ -265,6 +273,9 @@ def tool_terraform_destroy():
     if answer != "destroy bako":
         STATE["stop_now"] = "human did not approve"
         return "REFUSED: the human did not approve. Do nothing more."
+    ## Step before the snapshot: write down what the app looked like today (the pods and the database are gone tomorrow).
+    ## A problem here NEVER blocks the destroy: it is shown and skipped.
+    step_obs_save()
     ## Step before everything: save the database. If it cannot be saved, nothing is destroyed.
     print("Saving the database first (RDS snapshot)...")
     if not save_database():
@@ -1110,6 +1121,36 @@ def step_dns_check():
         return fail("dns", f"ExternalDNS pod: {seen['pod']}. DNS record: {seen['rec']}. The lab itself is up and reachable by the load balancer "
                            "address (kubectl get ingress bako -n bako). Look at: kubectl -n kube-system logs deployment/external-dns --tail=30")
     stage("dns", "done", f"{DNS_NAME} -> {alb}. DNS can still take a minute or two to reach your phone.")
+    return True
+
+def step_obs_save():
+    ## STOP, while the cluster is still up: read the backend pods and the database (read-only) and save ONE small file for today
+    ## to s3://<ops bucket>/obs-daily/YYYY-MM-DD.json. Counts, sizes, restart numbers, log shapes. Nothing a person typed.
+    if obs_data is None:
+        stage("obs", "skipped", "agent/env/obs_data.py is not installed, so today's facts are not saved. The destroy goes on.")
+        return True
+    stage("obs", "running", "writing down today's backend and database facts")
+    try:
+        store = sli.Store(AWSCLI, REGION, PROFILE, EXPECTED_ACCOUNT, env=CLEAN_ENV)
+        backend, why_b = obs_data.backend_live(KUBECTL, CLEAN_ENV, EXPECTED_ACCOUNT)
+        info, why_i = obs_data.rds_info(store, DB_ID)
+        db, why_d = (obs_data.db_live(KUBECTL, CLEAN_ENV, EXPECTED_ACCOUNT, info["host"], info["dbname"]) if info else (None, why_i))
+        traces, why_t = None, "trace reader not installed"
+        if obs_traces is not None and backend:                      # the receiver lives in the cluster: only worth asking while it is up
+            tf, why_t = obs_traces.traces_live(KUBECTL, CLEAN_ENV, EXPECTED_ACCOUNT)
+            traces = obs_traces.compact(tf)
+        if not backend and not db:
+            stage("obs", "skipped", f"nothing to save (backend: {why_b}; database: {why_d}). The destroy goes on.")
+            return True
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        ok, msg = obs_data.save_daily(store, obs_data.make_daily(day, backend, db, traces))
+        parts = [x for x in (("backend pods" if backend else ""), ("database" if db else ""), ("request traces" if traces else "")) if x]
+        if ok:
+            stage("obs", "done", f"saved {' and '.join(parts)} facts for {day}" + ("" if backend and db else f" (missing: {why_b if not backend else why_d})") + ("" if traces else f" (no traces: {why_t[:90]})"))
+        else:
+            stage("obs", "skipped", "could not save to S3, the destroy goes on: " + msg)
+    except Exception as e:
+        stage("obs", "skipped", f"unexpected problem, the destroy goes on: {e}")
     return True
 
 def step_sli():

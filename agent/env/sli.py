@@ -6,7 +6,8 @@ This file turns one UTC day of those lines into one small JSON file:
     s3://<bucket>/sli-daily/YYYY-MM-DD.json
 
 The file holds COUNTS AND TIMINGS ONLY: how many requests, how many failed or were slow, the 95th percentile time,
-and for each failed or slow request: the time, the status, the area (/api or the site) and how long it took.
+and for each request: the time, the method, the address WITHOUT its query string and with ids replaced by {id}
+(for example GET /api/goals/{id}), the status, and the three timings the load balancer measured.
 Never the address with its query string, never a request body, never an IP address, never anything about expenses.
 
 A "counted" request is one the app really answered or should have answered: it reached a pod, or the load balancer
@@ -29,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 SLOW_MS = 500
 KEEP_BAD = 50          # at most this many failed or slow requests are listed per day
+KEEP_REQS = 400        # at most this many requests are listed per day (all the bad ones first)
 DAILY_PREFIX = "sli-daily"
 LOG_PREFIX = "alb-logs"
 TOKEN = re.compile(r'"[^"]*"|\S+')
@@ -37,11 +39,35 @@ TOKEN = re.compile(r'"[^"]*"|\S+')
 ## ---------------------------------------------------------------
 ## Reading one log line
 ## ---------------------------------------------------------------
+UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+HEX = re.compile(r"^[0-9a-fA-F]{8,}$")
+SCHEMA = 2            # 2 = adds hourly numbers, per-endpoint numbers and a list of requests
+
+def norm_path(path):
+    ## /api/goals/123 and /api/goals/9f1c... both become /api/goals/{id}, so one endpoint is one line, not thousands.
+    out = []
+    for seg in path.split("/"):
+        if seg and (seg.isdigit() or UUID.match(seg) or HEX.match(seg) or len(seg) > 24):
+            seg = "{id}"
+        out.append(seg)
+    return "/".join(out) or "/"
+
+def endpoint_of(method, path, area):
+    ## the name shown on the page: "GET /api/goals/{id}", or a friendly name for the website's own files
+    if area == "api":
+        return f"{method} {norm_path(path)}"
+    last = path.rsplit("/", 1)[-1]
+    return f"{method} website files" if path.startswith("/assets/") or "." in last else f"{method} website page"
+
+def _ms(v):
+    return None if v < 0 else round(v * 1000)
+
 def parse_line(line):
     ## ALB access log: space separated, some fields in quotes. Field order is fixed by AWS:
     ## 0 type, 1 time, 2 elb, 3 client, 4 target, 5 request_time, 6 target_time, 7 response_time,
-    ## 8 elb_status, 9 target_status, 10 received, 11 sent, 12 "request", ...
+    ## 8 elb_status, 9 target_status, 10 received, 11 sent, 12 "request", ..., 24 error_reason
     ## Returns None for a line that does not look like one. Never raises.
+    ## Not read at all: client address, user agent, trace id, query string.
     f = TOKEN.findall(line)
     if len(f) < 13:
         return None
@@ -51,11 +77,17 @@ def parse_line(line):
     except ValueError:
         return None
     req = f[12].strip('"').split(" ")
+    method = req[0][:8] if req and req[0].isalpha() else "?"
     url = req[1] if len(req) > 1 else ""
     path = re.sub(r"^[a-z]+://[^/]*", "", url).split("?")[0]          # no host, no query string
     total_ms = None if any(t < 0 for t in times) else round(sum(times) * 1000)
-    return {"time": f[1], "status": status, "target": f[4], "total_ms": total_ms,
-            "area": "api" if path == "/api" or path.startswith("/api/") else "site"}
+    area = "api" if path == "/api" or path.startswith("/api/") else "site"
+    reason = f[24].strip('"') if len(f) > 24 else "-"
+    return {"time": f[1], "status": status, "target": f[4], "total_ms": total_ms, "area": area,
+            "method": method, "endpoint": endpoint_of(method, path, area),
+            "target_status": f[9] if f[9] != "-" else None,
+            "request_ms": _ms(times[0]), "target_ms": _ms(times[1]), "response_ms": _ms(times[2]),
+            "reason": reason if reason not in ("-", "") else None}
 
 def counted(r):
     ## reached a pod, or the load balancer itself failed it
@@ -70,12 +102,17 @@ def percentile(sorted_values, p):
     k = max(0, min(len(sorted_values) - 1, int(round(p / 100.0 * len(sorted_values) + 0.5)) - 1))
     return sorted_values[k]
 
+def _stats(times, n, slow, e5, c4=0):
+    t = sorted(times)
+    return {"n": n, "slow": slow, "e5": e5, "c4": c4, "p50": percentile(t, 50), "p95": percentile(t, 95)}
+
 def summarize_day(day, lines, files=0):
     ## day: "YYYY-MM-DD"; lines: iterable of raw log lines. Pure function, no AWS.
     total = noise = good = slow = e5 = unreadable = 0
     classes = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
     areas = {"api": 0, "site": 0}
     times, bad, first, last = [], [], None, None
+    hours, eps, reqs = {}, {}, []
     for line in lines:
         if not line.strip():
             continue
@@ -91,23 +128,96 @@ def summarize_day(day, lines, files=0):
         areas[r["area"]] += 1
         first = r["time"] if first is None or r["time"] < first else first
         last = r["time"] if last is None or r["time"] > last else last
+        is5, isslow = r["status"] >= 500, (r["status"] < 500 and is_bad(r))
         if r["total_ms"] is not None:
             times.append(r["total_ms"])
-        if r["status"] >= 500:
+        if is5:
             e5 += 1
-        elif is_bad(r):
+        elif isslow:
             slow += 1
         if is_bad(r):
             if len(bad) < KEEP_BAD:
                 bad.append({"time": r["time"][11:19], "status": r["status"], "area": r["area"], "ms": r["total_ms"]})
         else:
             good += 1
+        h = hours.setdefault(r["time"][11:13], {"t": [], "n": 0, "slow": 0, "e5": 0})
+        h["n"] += 1; h["slow"] += isslow; h["e5"] += is5
+        if r["total_ms"] is not None:
+            h["t"].append(r["total_ms"])
+        e = eps.setdefault(r["endpoint"], {"t": [], "n": 0, "slow": 0, "e5": 0, "c4": 0})
+        e["n"] += 1; e["slow"] += isslow; e["e5"] += is5; e["c4"] += (400 <= r["status"] < 500)
+        if r["total_ms"] is not None:
+            e["t"].append(r["total_ms"])
+        reqs.append({"time": r["time"][11:19], "method": r["method"], "endpoint": r["endpoint"], "area": r["area"],
+                     "status": r["status"], "target_status": r["target_status"], "ms": r["total_ms"],
+                     "request_ms": r["request_ms"], "target_ms": r["target_ms"], "response_ms": r["response_ms"],
+                     "reason": r["reason"], "good": not is_bad(r)})
     times.sort()
-    return {"day": day, "total": total, "good": good, "bad": total - good, "status_5xx": e5, "slow": slow,
+    hourly = [dict(_stats(v["t"], v["n"], v["slow"], v["e5"]), h=int(k)) for k, v in sorted(hours.items())]
+    ranked = sorted(eps.items(), key=lambda kv: -kv[1]["n"])
+    endpoints = {k: _stats(v["t"], v["n"], v["slow"], v["e5"], v["c4"]) for k, v in ranked[:30]}
+    if len(ranked) > 30:                                                     # the long tail in one line
+        rest = ranked[30:]
+        endpoints["other"] = _stats([x for _, v in rest for x in v["t"]], sum(v["n"] for _, v in rest),
+                                    sum(v["slow"] for _, v in rest), sum(v["e5"] for _, v in rest), sum(v["c4"] for _, v in rest))
+    if len(reqs) > KEEP_REQS:                                                # keep every bad one, then the rest in time order
+        badr = [x for x in reqs if not x["good"]][:KEEP_REQS]
+        okr = [x for x in reqs if x["good"]][:KEEP_REQS - len(badr)]
+        reqs = sorted(badr + okr, key=lambda x: x["time"])
+    return {"schema": SCHEMA, "day": day, "total": total, "good": good, "bad": total - good, "status_5xx": e5, "slow": slow,
             "classes": classes, "areas": areas, "noise": noise, "unreadable": unreadable,
             "p50_ms": percentile(times, 50), "p95_ms": percentile(times, 95), "max_ms": times[-1] if times else None,
             "first": first[11:19] if first else None, "last": last[11:19] if last else None,
+            "hourly": hourly, "endpoints": endpoints, "requests": reqs, "requests_complete": len(reqs) == total,
             "bad_requests": bad, "log_files": files, "slow_ms": SLOW_MS}
+
+
+## ---------------------------------------------------------------
+## "Why was it slow or failed?" - plain rules, no guessing. Used by the page and by Ask Bako.
+## ---------------------------------------------------------------
+def explain(r, typical_ms=None):
+    ## r: one request dict from a daily file. Returns a list of short sentences. Facts first, then what to check.
+    out, st, tms = [], r.get("status", 0), r.get("target_ms")
+    if st >= 500:
+        if r.get("target_status") is None:
+            out.append(f"The load balancer answered {st} itself. The request never reached a pod.")
+            out.append("Most likely there was no healthy pod at that moment (starting, restarting, or failing its health check). "
+                       "Check: kubectl -n bako get pods, and the pod events around " + str(r.get("time")) + " UTC.")
+        elif st == 504:
+            out.append("504: a pod was chosen but did not answer before the load balancer's timeout (60 s by default).")
+            out.append("Check: the backend log at that time, a slow database query, or a pod that was stuck.")
+        else:
+            out.append(f"A pod answered {r.get('target_status') or st}. The error came from the application, not from the network.")
+            out.append("Check: the backend pod log at " + str(r.get("time")) + " UTC for the stack trace.")
+        if r.get("reason"):
+            out.append(f"The load balancer's own reason: {r['reason']}.")
+    elif not r.get("good", True):
+        parts = [("the load balancer waiting to hand the request to a pod", r.get("request_ms")),
+                 ("the pod working on it", tms), ("sending the answer back", r.get("response_ms"))]
+        parts = [(n, v) for n, v in parts if v is not None]
+        if parts:
+            name, v = max(parts, key=lambda p: p[1])
+            out.append(f"It took {r.get('ms')} ms (limit {SLOW_MS} ms). Most of the time, {v} ms, was {name}.")
+            if name == "the pod working on it":
+                out.append("So the slowness is inside the app (backend code, database, or a cold pod), not the network.")
+            elif name.startswith("the load balancer"):
+                out.append("So the pods were busy or just starting. Check pod CPU and the number of replicas.")
+            else:
+                out.append("So the client was slow to receive the data, or the answer was large.")
+        if typical_ms:
+            out.append(f"Typical time for this endpoint: {typical_ms} ms.")
+    else:
+        out.append("This request was good: under the limit and not a 5xx.")
+    return out
+
+def _pooled(days, p):
+    ## exact percentile over many days, from the saved request lists; None if any day's list is incomplete or missing
+    ms = []
+    for d in days:
+        if d.get("total", 0) and not d.get("requests_complete"):
+            return None
+        ms += [r["ms"] for r in d.get("requests", []) if r.get("ms") is not None]
+    return percentile(sorted(ms), p) if ms else None
 
 def window_summary(days, n=30):
     ## days: list of daily dicts (any order). Totals over the newest n days that have data.
@@ -118,7 +228,8 @@ def window_summary(days, n=30):
     return {"days": len(days), "total": total, "bad": bad, "good": total - bad,
             "rate": (100.0 * (total - bad) / total) if total else None,
             "p95_ms_worst_day": max(p95s) if p95s else None,
-            "noise": sum(d.get("noise", 0) for d in days)}
+            "noise": sum(d.get("noise", 0) for d in days),
+            "p50_ms": _pooled(days, 50), "p95_ms": _pooled(days, 95)}
 
 
 ## ---------------------------------------------------------------
@@ -209,7 +320,8 @@ def candidate_days(existing, back=7, include_today=False, now=None):
         day = (now.date() - timedelta(days=i)).isoformat()
         cur = have.get(day)
         day_end = datetime.fromisoformat(day).replace(tzinfo=timezone.utc) + timedelta(days=1)
-        if cur is None or cur.get("rolled_at", "") < (day_end + timedelta(minutes=30)).isoformat():
+        if (cur is None or cur.get("rolled_at", "") < (day_end + timedelta(minutes=30)).isoformat()
+                or cur.get("schema", 1) < SCHEMA):                     # older files lack the new numbers: read the logs again
             out.append(day)
     return out
 
@@ -275,9 +387,24 @@ def selftest():
     assert [b["status"] for b in s["bad_requests"]] == [200, 502], s["bad_requests"]
     w = window_summary([s, dict(s, day="2026-11-04", total=4, bad=0, good=4, p95_ms=50)])
     assert w["total"] == 10 and w["bad"] == 2 and abs(w["rate"] - 80.0) < 1e-9, w
+    assert s["schema"] == 2 and s["requests_complete"], s
+    eps = s["endpoints"]
+    assert "GET /api/goals" in eps and eps["GET /api/goals"]["n"] == 3, eps          # 2 plain + 1 slow... see below
+    assert "GET /api/x" in eps and "GET website page" in eps, eps                    # query string dropped
+    assert norm_path("/api/goals/123/items/9f1c2d3e-1111-2222-3333-444455556666") == "/api/goals/{id}/items/{id}"
+    assert endpoint_of("GET", "/assets/index-ab12cd34.js", "site") == "GET website files"
+    assert sum(h["n"] for h in s["hourly"]) == 6 and s["hourly"][0]["h"] == 10, s["hourly"]
+    r502 = [x for x in s["requests"] if x["status"] == 502][0]
+    assert "no healthy pod" in " ".join(explain(r502)), explain(r502)
+    rslow = [x for x in s["requests"] if x["ms"] == 900][0]
+    assert "inside the app" in " ".join(explain(rslow)) or "load balancer" in " ".join(explain(rslow)), explain(rslow)
+    assert "good" in explain(s["requests"][0])[0]
+    assert all(k not in json.dumps(s) for k in ("UA/1.0", "Root=1-x", "token=")), "private data leaked"
     now = datetime(2026, 11, 6, 9, 0, tzinfo=timezone.utc)
-    done = {"day": "2026-11-05", "rolled_at": "2026-11-06T08:00:00+00:00"}
-    early = {"day": "2026-11-04", "rolled_at": "2026-11-04T23:50:00+00:00"}       # rolled before the day was over
+    done = {"schema": 2, "day": "2026-11-05", "rolled_at": "2026-11-06T08:00:00+00:00"}
+    early = {"schema": 2, "day": "2026-11-04", "rolled_at": "2026-11-04T23:50:00+00:00"}       # rolled before the day was over
+    old = {"day": "2026-11-03", "rolled_at": "2026-11-04T08:00:00+00:00"}          # finished day, but schema 1
+    assert "2026-11-03" in candidate_days([done, old], back=3, now=now)
     c = candidate_days([done, early], back=3, now=now)
     assert "2026-11-05" not in c and "2026-11-04" in c and "2026-11-03" in c, c
     print("sli selftest: all checks passed")

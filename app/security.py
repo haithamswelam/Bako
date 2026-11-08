@@ -13,19 +13,25 @@ pwd_context = CryptContext(
     deprecated="auto"
 )
 
+from opentelemetry import trace as _trace
+
+_tracer = _trace.get_tracer("bako.security")      # does nothing when tracing is off
+
 # Hash password
 def hash_password(password: str):
-    return pwd_context.hash(password)
+    with _tracer.start_as_current_span("password.hash"):
+        return pwd_context.hash(password)
 
 # Verify password
 def verify_password(
     plain_password: str,
     hashed_password: str
 ):
-    return pwd_context.verify(
-        plain_password,
-        hashed_password
-    )
+    with _tracer.start_as_current_span("password.verify"):
+        return pwd_context.verify(
+            plain_password,
+            hashed_password
+        )
 
 # Create JWT token
 def create_access_token(data: dict):

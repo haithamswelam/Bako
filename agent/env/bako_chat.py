@@ -578,14 +578,29 @@ def load_charter_notes(repo):
     except OSError:
         return ""
 
-def run_turn(client, model, history, user_text, repo):
+MAX_TOOL_CALLS_SRE = 4       # SRE mode: the evidence pack does the first look, tools only fill gaps
+
+def run_turn(client, model, history, user_text, repo, mode="lab"):
+    ## mode "lab": the lab assistant (tools for the lab, git, CI; it can only PROPOSE actions).
+    ## mode "sre": the app's SRE assistant (its own read-only tools in sre.py; it gets an evidence pack in the question; no proposals).
     global LAST_TOOLS, LAST_TRACE
     LAST_TOOLS = []
-    notes = load_charter_notes(repo)
-    rules = CHAT_CHARTER + (LEAN_EXTRA if LEAN else "")
-    tools = active_tools()
-    system = rules + "\n\n" + notes
-    past = history[-(MAX_HISTORY_LEAN if LEAN else MAX_HISTORY):]
+    sre_mode = (mode == "sre")
+    if sre_mode:
+        import sre
+        notes = ""
+        rules = sre.SRE_CHARTER
+        tools = sre.TOOLS
+        handlers = sre.HANDLERS
+        max_calls = MAX_TOOL_CALLS_SRE
+    else:
+        notes = load_charter_notes(repo)
+        rules = CHAT_CHARTER + (LEAN_EXTRA if LEAN else "")
+        tools = active_tools()
+        handlers = HANDLERS
+        max_calls = MAX_TOOL_CALLS
+    system = rules + ("\n\n" + notes if notes else "")
+    past = [] if sre_mode else history[-(MAX_HISTORY_LEAN if LEAN else MAX_HISTORY):]       # a case stands on its own evidence
     if LEAN:                     # old answers are re-sent on every call, so long ones are shortened
         past = [dict(m, content=m["content"][:HISTORY_REPLY_CAP] + " ...(shortened)")
                 if m.get("role") == "assistant" and len(m.get("content") or "") > HISTORY_REPLY_CAP else m for m in past]
@@ -593,9 +608,9 @@ def run_turn(client, model, history, user_text, repo):
            [{"role": "user", "content": user_text}]
     trace = {"time": datetime.datetime.now().isoformat(timespec="seconds"), "model": model,
              "question": _cap(user_text, TRACE_MSG_CAP),
-             "mode": "lean" if LEAN else "old", "system_chars": len(system), "builtin_rules_chars": len(rules), "notes_chars": len(notes),
-             "history_count": len(past), "max_tool_calls": MAX_TOOL_CALLS,
-             "cost_budget": TURN_COST_BUDGET if LEAN else None, "spent": 0.0, "stopped_by": None,
+             "mode": "sre" if sre_mode else ("lean" if LEAN else "old"), "system_chars": len(system), "builtin_rules_chars": len(rules), "notes_chars": len(notes),
+             "history_count": len(past), "max_tool_calls": max_calls,
+             "cost_budget": TURN_COST_BUDGET if (LEAN or sre_mode) else None, "spent": 0.0, "stopped_by": None,
              ## where the first call's input goes (estimates: characters / 4). Resent on EVERY call of the message.
              "anatomy": {"rules": len(rules) // 4, "charter_md": len(notes) // 4, "tool_menu": len(json.dumps(tools)) // 4,
                          "earlier_messages": sum(len(m.get("content") or "") for m in past) // 4, "your_question": len(user_text) // 4},
@@ -606,9 +621,9 @@ def run_turn(client, model, history, user_text, repo):
     prices = usage.get_prices(repo)
     reply = ""
     done = set()                 # (tool, arguments) already called in this turn
-    for n in range(MAX_TOOL_CALLS + 1):
-        over_cost = LEAN and n > 0 and trace["spent"] >= TURN_COST_BUDGET
-        last = (n == MAX_TOOL_CALLS) or over_cost
+    for n in range(max_calls + 1):
+        over_cost = (LEAN or sre_mode) and n > 0 and trace["spent"] >= TURN_COST_BUDGET
+        last = (n == max_calls) or over_cost
         if last:                 # budget used: force a plain answer from what we already know
             trace["stopped_by"] = "cost_budget" if over_cost else "tool_limit"
             msgs.append({"role": "system", "content":
@@ -664,7 +679,7 @@ def run_turn(client, model, history, user_text, repo):
             done.add(key)
             try:
                 args = json.loads(call.function.arguments or "{}")
-                fn = HANDLERS.get(call.function.name)
+                fn = handlers.get(call.function.name)
                 result = fn(repo, ctx, **args) if fn else "ERROR: unknown tool"
             except Exception as e:                   # tool errors go back to the model as text
                 result = f"ERROR: {e}"
@@ -681,6 +696,7 @@ def run_turn(client, model, history, user_text, repo):
     trace["reply"] = _cap(reply, TRACE_MSG_CAP)
     trace["tokens"] = tokens
     trace["proposal"] = (ctx["action"] or {}).get("type")
+    trace["case_mode"] = "sre" if sre_mode else "lab"
     _save_trace(repo, trace)
     return reply, ctx["action"], tokens
 
